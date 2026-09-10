@@ -444,3 +444,211 @@ jobs:
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:${{ matrix.language }}"          
+
+  suspicious-code-binary-scan:
+    name: Suspicious Code and Binary Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inspect repository
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p security-inspection
+
+          echo "========================================"
+          echo "Suspicious Code / Binary Inspection"
+          echo "========================================"
+
+          echo ""
+          echo "1. Potential remote-code execution patterns"
+          echo "--------------------------------------------"
+
+          rg -n -i \
+            --hidden \
+            --glob '!.git/**' \
+            --glob '!**/node_modules/**' \
+            --glob '!**/.venv/**' \
+            --glob '!**/venv/**' \
+            --glob '!**/__pycache__/**' \
+            --glob '!**/dist/**' \
+            --glob '!**/build/**' \
+            'curl[[:space:]].*\|[[:space:]]*(sh|bash)|wget[[:space:]].*\|[[:space:]]*(sh|bash)|curl[[:space:]].*-o.*&&.*(sh|bash)|wget[[:space:]].*-O.*&&.*(sh|bash)' \
+            . \
+            > security-inspection/remote-execution.txt
+
+          echo ""
+          echo "2. Potential dynamic execution patterns"
+          echo "---------------------------------------"
+
+          rg -n \
+            --hidden \
+            --glob '!.git/**' \
+            --glob '!**/node_modules/**' \
+            --glob '!**/.venv/**' \
+            --glob '!**/venv/**' \
+            --glob '!**/__pycache__/**' \
+            'eval[[:space:]]*\(|exec[[:space:]]*\(|os\.system[[:space:]]*\(|subprocess\..*shell[[:space:]]*=[[:space:]]*True' \
+            . \
+            > security-inspection/dynamic-execution.txt
+
+          echo ""
+          echo "3. Potential encoded/obfuscated execution"
+          echo "-----------------------------------------"
+
+          rg -n -i \
+            --hidden \
+            --glob '!.git/**' \
+            --glob '!**/node_modules/**' \
+            --glob '!**/.venv/**' \
+            --glob '!**/venv/**' \
+            --glob '!**/__pycache__/**' \
+            'base64[[:space:]]+(-d|--decode)|frombase64string|atob[[:space:]]*\(' \
+            . \
+            > security-inspection/encoded-execution.txt
+
+          echo ""
+          echo "4. Potential permission manipulation"
+          echo "------------------------------------"
+
+          rg -n \
+            --hidden \
+            --glob '!.git/**' \
+            --glob '!**/node_modules/**' \
+            'chmod[[:space:]]+\+x|chmod[[:space:]]+777|install[[:space:]]+-m[[:space:]]+777' \
+            . \
+            > security-inspection/permission-changes.txt
+
+          echo ""
+          echo "5. External download patterns"
+          echo "-----------------------------"
+
+          rg -n -i \
+            --hidden \
+            --glob '!.git/**' \
+            --glob '!**/node_modules/**' \
+            --glob '!**/.venv/**' \
+            --glob '!**/venv/**' \
+            'https?://|requests\.(get|post)|urllib\.request|httpx\.(get|post)|wget[[:space:]]|curl[[:space:]]' \
+            . \
+            > security-inspection/external-downloads.txt
+
+          echo ""
+          echo "6. Executable / binary inventory"
+          echo "--------------------------------"
+
+          find . \
+            -path './.git' -prune -o \
+            -path '*/node_modules' -prune -o \
+            -path '*/.venv' -prune -o \
+            -path '*/venv' -prune -o \
+            -type f -print0 |
+          while IFS= read -r -d '' file; do
+            file "$file"
+          done |
+          grep -E 'ELF|Mach-O|PE32|executable' \
+            > security-inspection/binaries.txt
+
+          echo ""
+          echo "7. Git-tracked executable files"
+          echo "--------------------------------"
+
+          git ls-files -s |
+            awk '$1 ~ /^100755$/ {print $4}' \
+            > security-inspection/tracked-executables.txt
+
+          echo ""
+          echo "Inspection completed."
+          echo "All findings are report-only."
+          echo ""
+
+          for f in security-inspection/*.txt; do
+            echo "===== $f ====="
+            if [ -s "$f" ]; then
+              cat "$f"
+            else
+              echo "No findings"
+            fi
+            echo ""
+          done
+
+      - name: Generate inspection summary
+        if: always()
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          base = Path("security-inspection")
+
+          files = {
+              "remote_execution": "remote-execution.txt",
+              "dynamic_execution": "dynamic-execution.txt",
+              "encoded_execution": "encoded-execution.txt",
+              "permission_changes": "permission-changes.txt",
+              "external_downloads": "external-downloads.txt",
+              "binaries": "binaries.txt",
+              "tracked_executables": "tracked-executables.txt",
+          }
+
+          report = {}
+
+          for name, filename in files.items():
+              path = base / filename
+
+              if path.exists():
+                  lines = [
+                      line.strip()
+                      for line in path.read_text(
+                          encoding="utf-8",
+                          errors="replace"
+                      ).splitlines()
+                      if line.strip()
+                  ]
+              else:
+                  lines = []
+
+              report[name] = {
+                  "count": len(lines),
+                  "findings": lines
+              }
+
+          total = sum(
+              item["count"]
+              for item in report.values()
+          )
+
+          output = {
+              "summary": {
+                  "total_indicators": total
+              },
+              "checks": report
+          }
+
+          with open(
+              base / "suspicious-code-binary-report.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(output, f, indent=2)
+
+          print("Suspicious Code / Binary Summary")
+          print("================================")
+          print(f"Total indicators: {total}")
+
+          for name, item in report.items():
+              print(f"{name}: {item['count']}")
+          PY
+
+      - name: Upload inspection report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suspicious-code-binary-report
+          path: security-inspection/
+          if-no-files-found: warn          
