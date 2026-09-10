@@ -652,3 +652,99 @@ jobs:
           name: suspicious-code-binary-report
           path: security-inspection/
           if-no-files-found: warn          
+
+  dockerfile-security-scan:
+    name: Dockerfile Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          set -e
+
+          TRIVY_VERSION="0.74.0"
+
+          wget -q \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+
+          tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+
+          sudo mv trivy /usr/local/bin/trivy
+
+          trivy --version
+
+      - name: Scan Dockerfiles
+        run: |
+          set +e
+
+          mkdir -p docker-security
+
+          trivy config . \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output dockerfile-trivy-report.json \
+            --exit-code 0
+
+          echo ""
+          echo "Dockerfile scan completed."
+
+          python3 <<'PY'
+          import json
+
+          with open("dockerfile-trivy-report.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          findings = []
+
+          for result in data.get("Results", []):
+              target = result.get("Target", "")
+
+              for misconfig in result.get("Misconfigurations", []) or []:
+                  findings.append({
+                      "id": misconfig.get("ID"),
+                      "severity": misconfig.get("Severity"),
+                      "title": misconfig.get("Title"),
+                      "target": target,
+                      "primary_url": misconfig.get("PrimaryURL"),
+                  })
+
+          report = {
+              "summary": {
+                  "total_findings": len(findings)
+              },
+              "findings": findings
+          }
+
+          with open(
+              "docker-security/dockerfile-security-report.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(report, f, indent=2)
+
+          print("")
+          print("Dockerfile Security Summary")
+          print("============================")
+          print(f"Total HIGH/CRITICAL findings: {len(findings)}")
+
+          for item in findings:
+              print(
+                  f"- {item['id']} | "
+                  f"{item['severity']} | "
+                  f"{item['target']} | "
+                  f"{item['title']}"
+              )
+          PY
+
+          rm -f dockerfile-trivy-report.json
+
+      - name: Upload Dockerfile security report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dockerfile-security-report
+          path: docker-security/
+          if-no-files-found: warn          
