@@ -748,3 +748,124 @@ jobs:
           name: dockerfile-security-report
           path: docker-security/
           if-no-files-found: warn          
+
+  docker-image-security-scan:
+    name: Docker Image Security Scan
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build OpenSandbox server image
+        run: |
+          set -e
+
+          docker build \
+            --file server/Dockerfile \
+            --tag opensandbox-server:security-validation \
+            .
+
+      - name: Install Trivy
+        run: |
+          set -e
+
+          TRIVY_VERSION="0.74.0"
+
+          wget -q \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+
+          tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+
+          sudo mv trivy /usr/local/bin/trivy
+
+          trivy --version
+
+      - name: Scan Docker image
+        run: |
+          set +e
+
+          mkdir -p docker-image-security
+
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output trivy-image-raw.json \
+            --exit-code 0 \
+            opensandbox-server:security-validation
+
+          python3 <<'PY'
+          import json
+          from collections import Counter
+
+          with open("trivy-image-raw.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          findings = []
+
+          for result in data.get("Results", []):
+              target = result.get("Target", "")
+
+              for vuln in result.get("Vulnerabilities", []) or []:
+                  findings.append({
+                      "vulnerability_id": vuln.get("VulnerabilityID"),
+                      "severity": vuln.get("Severity"),
+                      "package": vuln.get("PkgName"),
+                      "installed_version": vuln.get("InstalledVersion"),
+                      "fixed_version": vuln.get("FixedVersion"),
+                      "target": target,
+                      "title": vuln.get("Title")
+                  })
+
+          counts = Counter(
+              finding.get("severity") or "UNKNOWN"
+              for finding in findings
+          )
+
+          report = {
+              "image": "opensandbox-server:security-validation",
+              "summary": {
+                  "total_findings": len(findings),
+                  "critical": counts.get("CRITICAL", 0),
+                  "high": counts.get("HIGH", 0)
+              },
+              "findings": findings
+          }
+
+          with open(
+              "docker-image-security/docker-image-security-report.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(report, f, indent=2)
+
+          print("")
+          print("========================================")
+          print("Docker Image Security Summary")
+          print("========================================")
+          print(f"Total HIGH/CRITICAL : {len(findings)}")
+          print(f"CRITICAL           : {counts.get('CRITICAL', 0)}")
+          print(f"HIGH               : {counts.get('HIGH', 0)}")
+
+          for finding in findings:
+              print(
+                  f"- {finding['vulnerability_id']} | "
+                  f"{finding['severity']} | "
+                  f"{finding['package']} | "
+                  f"{finding['installed_version']} -> "
+                  f"{finding['fixed_version'] or 'no fixed version'}"
+              )
+          PY
+
+          rm -f trivy-image-raw.json
+
+      - name: Upload Docker image report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-security-report
+          path: docker-image-security/
+          if-no-files-found: warn
