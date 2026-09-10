@@ -1,0 +1,59 @@
+name: Aviradigital Security Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  license-dependency-scan:
+    name: License & Dependency Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://get.anchore.io/syft | sh -s -- -b /usr/local/bin
+          syft version
+
+      - name: Generate SBOM and license inventory
+        run: |
+          syft scan dir:. \
+            --enrich javascript,python \
+            -o syft-json=license-report.json
+
+      - name: Show scan summary
+        run: |
+          python3 - <<'PY'
+          import json
+
+          with open("license-report.json") as f:
+              data = json.load(f)
+
+          artifacts = data.get("artifacts", [])
+          licenses = data.get("licenses", [])
+
+          print("======================================")
+          print("OpenSandbox License Scan")
+          print("======================================")
+          print(f"Artifacts detected : {len(artifacts)}")
+          print(f"License records    : {len(licenses)}")
+          print("======================================")
+          PY
+
+      - name: Upload license report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensandbox-license-report
+          path: license-report.json
+          retention-days: 7
