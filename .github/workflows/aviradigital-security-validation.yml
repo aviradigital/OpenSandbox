@@ -15,41 +15,117 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ---------------------------------------------------------
+      # 1. Checkout source code
+      # ---------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
+      # ---------------------------------------------------------
+      # 2. Install Syft
+      # ---------------------------------------------------------
       - name: Install Syft
         run: |
-          curl -sSfL https://get.anchore.io/syft | sh -s -- -b /usr/local/bin
+          set -e
+
+          echo "Installing Syft..."
+
+          curl -sSfL https://get.anchore.io/syft \
+            | sh -s -- -b /usr/local/bin
+
+          echo "Syft version:"
           syft version
 
+      # ---------------------------------------------------------
+      # 3. Generate SBOM + license inventory
+      # ---------------------------------------------------------
       - name: Generate SBOM and license inventory
         run: |
+          set -e
+
+          echo "Starting OpenSandbox dependency and license scan..."
+
           syft scan dir:. \
             --enrich javascript,python \
             -o syft-json=license-report.json
 
+          echo "License/dependency scan completed."
+
+          echo "Generated report:"
+          ls -lh license-report.json
+
+      # ---------------------------------------------------------
+      # 4. Analyze Syft report
+      # ---------------------------------------------------------
       - name: Show scan summary
         run: |
           python3 - <<'PY'
           import json
+          from collections import Counter
 
-          with open("license-report.json") as f:
+          REPORT = "license-report.json"
+
+          with open(REPORT, "r", encoding="utf-8") as f:
               data = json.load(f)
 
           artifacts = data.get("artifacts", [])
-          licenses = data.get("licenses", [])
 
-          print("======================================")
-          print("OpenSandbox License Scan")
-          print("======================================")
+          license_records = []
+          license_counts = Counter()
+
+          for artifact in artifacts:
+              artifact_name = artifact.get("name", "UNKNOWN")
+              artifact_version = artifact.get("version", "UNKNOWN")
+              artifact_type = artifact.get("type", "UNKNOWN")
+
+              licenses = artifact.get("licenses") or []
+
+              for license_info in licenses:
+
+                  if not isinstance(license_info, dict):
+                      continue
+
+                  license_value = (
+                      license_info.get("spdxExpression")
+                      or license_info.get("value")
+                      or "UNKNOWN"
+                  )
+
+                  license_records.append(
+                      {
+                          "package": artifact_name,
+                          "version": artifact_version,
+                          "type": artifact_type,
+                          "license": license_value,
+                      }
+                  )
+
+                  license_counts[license_value] += 1
+
+          print("")
+          print("==============================================")
+          print("       OpenSandbox License Scan")
+          print("==============================================")
           print(f"Artifacts detected : {len(artifacts)}")
-          print(f"License records    : {len(licenses)}")
-          print("======================================")
+          print(f"License records    : {len(license_records)}")
+          print("----------------------------------------------")
+          print("License summary")
+          print("----------------------------------------------")
+
+          if license_counts:
+              for license_name, count in license_counts.most_common():
+                  print(f"{license_name}: {count}")
+          else:
+              print("No license records detected.")
+
+          print("==============================================")
           PY
 
+      # ---------------------------------------------------------
+      # 5. Upload complete Syft report
+      # ---------------------------------------------------------
       - name: Upload license report
         if: always()
         uses: actions/upload-artifact@v4
