@@ -767,7 +767,7 @@ jobs:
           docker build \
             --file server/Dockerfile \
             --tag opensandbox-server:security-validation \
-            .
+            server
 
       - name: Install Trivy
         run: |
