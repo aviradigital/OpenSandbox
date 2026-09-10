@@ -295,3 +295,121 @@ jobs:
           name: opensandbox-vulnerability-report
           path: trivy-vulnerability-report.json
           retention-days: 7
+
+  secrets-scan:
+    name: Secrets Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget
+
+          TRIVY_VERSION="0.74.0"
+
+          wget -q \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+
+          tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+
+          sudo mv trivy /usr/local/bin/trivy
+
+          trivy --version
+
+      - name: Run secrets scan
+        run: |
+          set -e
+
+          trivy fs . \
+            --scanners secret \
+            --format json \
+            --output trivy-secret-raw.json \
+            --exit-code 0
+
+      - name: Create sanitized secrets report
+        run: |
+          python3 <<'PY'
+          import json
+          from collections import Counter
+
+          input_file = "trivy-secret-raw.json"
+          output_file = "secret-scan-report.json"
+
+          with open(input_file, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          findings = []
+
+          for result in data.get("Results", []):
+              target = result.get("Target", "")
+
+              for secret in result.get("Secrets", []) or []:
+                  findings.append({
+                      "rule_id": secret.get("RuleID"),
+                      "category": secret.get("Category"),
+                      "severity": secret.get("Severity"),
+                      "title": secret.get("Title"),
+                      "target": target,
+                      "start_line": secret.get("StartLine"),
+                      "end_line": secret.get("EndLine")
+                  })
+
+          severity_counts = Counter(
+              item.get("severity") or "UNKNOWN"
+              for item in findings
+          )
+
+          report = {
+              "summary": {
+                  "total_findings": len(findings),
+                  "critical": severity_counts.get("CRITICAL", 0),
+                  "high": severity_counts.get("HIGH", 0),
+                  "medium": severity_counts.get("MEDIUM", 0),
+                  "low": severity_counts.get("LOW", 0),
+                  "unknown": severity_counts.get("UNKNOWN", 0)
+              },
+              "findings": findings
+          }
+
+          with open(output_file, "w", encoding="utf-8") as f:
+              json.dump(report, f, indent=2)
+
+          print("Secrets scan summary")
+          print("====================")
+          print(f"Total findings : {len(findings)}")
+          print(f"Critical       : {severity_counts.get('CRITICAL', 0)}")
+          print(f"High           : {severity_counts.get('HIGH', 0)}")
+          print(f"Medium         : {severity_counts.get('MEDIUM', 0)}")
+          print(f"Low            : {severity_counts.get('LOW', 0)}")
+          print(f"Unknown        : {severity_counts.get('UNKNOWN', 0)}")
+
+          if findings:
+              print("")
+              print("Potential secrets detected:")
+              for item in findings:
+                  print(
+                      f"- {item['rule_id']} | "
+                      f"{item['severity']} | "
+                      f"{item['target']} | "
+                      f"line {item['start_line']}"
+                  )
+          else:
+              print("")
+              print("No secrets detected.")
+          PY
+
+          # Never retain the raw report because it may contain
+          # the actual secret value.
+          rm -f trivy-secret-raw.json
+
+      - name: Upload sanitized secrets report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: secrets-scan-report
+          path: secret-scan-report.json
+          if-no-files-found: warn          
