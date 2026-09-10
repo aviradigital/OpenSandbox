@@ -161,3 +161,137 @@ jobs:
           name: opensandbox-license-policy-report
           path: license-policy-report.json
           retention-days: 7
+
+  vulnerability-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Trivy
+        run: |
+          set -e
+
+          echo "Installing Trivy..."
+
+          sudo apt-get update
+          sudo apt-get install -y wget
+
+          wget -qO- https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | sudo gpg --dearmor \
+            | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+          echo "Trivy version:"
+          trivy --version
+
+      - name: Run filesystem vulnerability scan
+        run: |
+          set +e
+
+          echo "Starting OpenSandbox vulnerability scan..."
+
+          trivy fs . \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output trivy-vulnerability-report.json
+
+          TRIVY_EXIT_CODE=$?
+
+          echo "Trivy exit code: ${TRIVY_EXIT_CODE}"
+
+          if [ -f trivy-vulnerability-report.json ]; then
+            echo "Vulnerability report generated:"
+            ls -lh trivy-vulnerability-report.json
+          fi
+
+          # Report-only for MVP.
+          # Vulnerabilities will NOT block the pipeline yet.
+          exit 0
+
+      - name: Show vulnerability summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          from collections import Counter
+
+          report = "trivy-vulnerability-report.json"
+
+          try:
+              with open(report, "r", encoding="utf-8") as f:
+                  data = json.load(f)
+          except FileNotFoundError:
+              print("No Trivy report found.")
+              raise SystemExit(0)
+
+          severity_counts = Counter()
+          vulnerability_count = 0
+
+          for result in data.get("Results", []):
+              for vulnerability in result.get("Vulnerabilities") or []:
+                  vulnerability_count += 1
+                  severity = vulnerability.get("Severity", "UNKNOWN")
+                  severity_counts[severity] += 1
+
+          print("")
+          print("==============================================")
+          print("     OpenSandbox Vulnerability Summary")
+          print("==============================================")
+          print(f"Total vulnerabilities : {vulnerability_count}")
+          print(f"CRITICAL              : {severity_counts['CRITICAL']}")
+          print(f"HIGH                  : {severity_counts['HIGH']}")
+          print(f"MEDIUM                : {severity_counts['MEDIUM']}")
+          print(f"LOW                   : {severity_counts['LOW']}")
+          print(f"UNKNOWN               : {severity_counts['UNKNOWN']}")
+          print("==============================================")
+
+          print("")
+          print("Top vulnerability findings:")
+          print("----------------------------------------------")
+
+          shown = 0
+
+          for result in data.get("Results", []):
+              target = result.get("Target", "UNKNOWN")
+
+              for vulnerability in result.get("Vulnerabilities") or []:
+                  vuln_id = vulnerability.get("VulnerabilityID", "UNKNOWN")
+                  severity = vulnerability.get("Severity", "UNKNOWN")
+                  package = vulnerability.get("PkgName", "UNKNOWN")
+                  installed = vulnerability.get("InstalledVersion", "UNKNOWN")
+                  fixed = vulnerability.get("FixedVersion", "Not available")
+
+                  print(
+                      f"{severity:8} "
+                      f"{vuln_id:20} "
+                      f"{package} "
+                      f"{installed} "
+                      f"-> {fixed} "
+                      f"[{target}]"
+                  )
+
+                  shown += 1
+
+                  if shown >= 50:
+                      print("... showing first 50 findings")
+                      raise SystemExit(0)
+          PY
+
+      - name: Upload vulnerability report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensandbox-vulnerability-report
+          path: trivy-vulnerability-report.json
+          retention-days: 7
