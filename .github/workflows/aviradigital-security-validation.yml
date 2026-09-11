@@ -869,3 +869,17 @@ jobs:
           name: docker-image-security-report
           path: docker-image-security/
           if-no-files-found: warn
+
+- name: Generate image SBOM
+  uses: anchore/sbom-action@v0
+  with:
+    image: opensandbox-server:security-validation
+    format: cyclonedx-json
+    output-file: sbom-opensandbox-server.json
+    upload-artifact: false
+
+- name: Upload image SBOM
+  uses: actions/upload-artifact@v4
+  with:
+    name: opensandbox-image-sbom
+    path: sbom-opensandbox-server.json          
