@@ -1,4 +1,3 @@
-```dockerfile
 # Copyright 2026 Alibaba Group Holding Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM python:3.10.21-slim-trixie@sha256:4101e4a31b9d2c927c9052ae2fa58b76a89265997ec9209c02933d9974214b80 AS builder
+FROM python:3.10-slim@sha256:8c97ebedc32fd60935cdf5992e935753e2a0f98231830028050e1e04bd3c13c2 AS builder
 
 # Optional: inject the release version when .git is unavailable so hatch-vcs
 # resolves the real version instead of falling back to 0.1.0.dev0. Passed by
@@ -42,12 +41,13 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY opensandbox_server ./opensandbox_server
+
 COPY LICENSE README.md ./
 
 # Install the project itself into the venv (deps already synced)
 RUN uv pip install --no-deps --editable .
 
-FROM python:3.10.21-slim-trixie@sha256:4101e4a31b9d2c927c9052ae2fa58b76a89265997ec9209c02933d9974214b80 AS runtime
+FROM python:3.10-slim@sha256:8c97ebedc32fd60935cdf5992e935753e2a0f98231830028050e1e04bd3c13c2 AS runtime
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -59,14 +59,19 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
+
 COPY --from=builder /app/opensandbox_server /app/opensandbox_server
+
 COPY --from=builder /app/opensandbox_server/examples/example.config.k8s.toml /etc/opensandbox/config.toml
+
 COPY --from=builder /app/opensandbox_server/examples/example.config.k8s.zh.toml /etc/opensandbox/config.zh.toml
+
 COPY --from=builder /app/opensandbox_server/examples/example.batchsandbox-template.yaml /etc/opensandbox/example.batchsandbox-template.yaml
+
 COPY --from=builder /app/opensandbox_server/examples/e2e.batchsandbox-template.yaml /etc/opensandbox/e2e.batchsandbox-template.yaml
 
 EXPOSE 8080
 
 ENTRYPOINT ["opensandbox-server"]
+
 CMD ["--config", "/etc/opensandbox/config.toml"]
-```
