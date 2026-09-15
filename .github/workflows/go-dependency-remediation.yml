@@ -18,7 +18,7 @@ jobs:
     steps:
 
       # ---------------------------------------------------------
-      # Checkout
+      # Checkout remediation branch
       # ---------------------------------------------------------
       - name: Checkout remediation branch
         uses: actions/checkout@v4
@@ -36,7 +36,7 @@ jobs:
           cache: true
 
       # ---------------------------------------------------------
-      # Verify Go
+      # Verify Go installation
       # ---------------------------------------------------------
       - name: Verify Go installation
         shell: bash
@@ -78,6 +78,7 @@ jobs:
 
             echo
             echo "Current relevant dependencies:"
+
             go list -m all | grep -E \
               'golang.org/x/(mod|net|text|crypto)|google.golang.org/grpc' \
               || true
@@ -99,14 +100,15 @@ jobs:
 
           go get \
             golang.org/x/mod@v0.40.0 \
-            golang.org/x/net@v0.56.0 \
-            golang.org/x/text@v0.39.0 \
+            golang.org/x/net@v0.58.0 \
+            golang.org/x/text@v0.41.0 \
             google.golang.org/grpc@v1.83.2
 
           go mod tidy
 
           echo
           echo "Final egress dependency versions:"
+
           go list -m all | grep -E \
             'golang.org/x/(mod|net|text|crypto)|google.golang.org/grpc' \
             || true
@@ -125,14 +127,15 @@ jobs:
 
           go get \
             golang.org/x/crypto@v0.55.0 \
-            golang.org/x/net@v0.56.0 \
-            golang.org/x/text@v0.39.0 \
+            golang.org/x/net@v0.58.0 \
+            golang.org/x/text@v0.41.0 \
             google.golang.org/grpc@v1.83.2
 
           go mod tidy
 
           echo
           echo "Final execd dependency versions:"
+
           go list -m all | grep -E \
             'golang.org/x/(mod|net|text|crypto)|google.golang.org/grpc' \
             || true
@@ -150,14 +153,15 @@ jobs:
           echo "Updating vulnerable dependencies in ingress..."
 
           go get \
-            golang.org/x/net@v0.56.0 \
-            golang.org/x/text@v0.39.0 \
+            golang.org/x/net@v0.58.0 \
+            golang.org/x/text@v0.41.0 \
             google.golang.org/grpc@v1.83.2
 
           go mod tidy
 
           echo
           echo "Final ingress dependency versions:"
+
           go list -m all | grep -E \
             'golang.org/x/(mod|net|text|crypto)|google.golang.org/grpc' \
             || true
@@ -175,14 +179,15 @@ jobs:
           echo "Updating vulnerable dependencies in internal..."
 
           go get \
-            golang.org/x/net@v0.56.0 \
-            golang.org/x/text@v0.39.0 \
+            golang.org/x/net@v0.58.0 \
+            golang.org/x/text@v0.41.0 \
             google.golang.org/grpc@v1.83.2
 
           go mod tidy
 
           echo
           echo "Final internal dependency versions:"
+
           go list -m all | grep -E \
             'golang.org/x/(mod|net|text|crypto)|google.golang.org/grpc' \
             || true
@@ -200,14 +205,15 @@ jobs:
           echo "Updating vulnerable dependencies in nodeagent..."
 
           go get \
-            golang.org/x/net@v0.56.0 \
-            golang.org/x/text@v0.39.0 \
+            golang.org/x/net@v0.58.0 \
+            golang.org/x/text@v0.41.0 \
             google.golang.org/grpc@v1.83.2
 
           go mod tidy
 
           echo
           echo "Final nodeagent dependency versions:"
+
           go list -m all | grep -E \
             'golang.org/x/(mod|net|text|crypto)|google.golang.org/grpc' \
             || true
@@ -215,10 +221,8 @@ jobs:
       # ---------------------------------------------------------
       # Remediate Kubernetes dependencies
       #
-      # NOTE:
-      # Kubernetes dependencies are updated here, but Kubernetes
-      # integration/E2E tests are intentionally NOT executed in
-      # this Docker-focused remediation workflow.
+      # Kubernetes dependencies are updated, but Kubernetes
+      # integration/E2E tests are not executed in this workflow.
       # ---------------------------------------------------------
       - name: Remediate Kubernetes dependencies
         shell: bash
@@ -230,20 +234,21 @@ jobs:
           echo "Updating vulnerable dependencies in Kubernetes..."
 
           go get \
-            golang.org/x/net@v0.56.0 \
-            golang.org/x/text@v0.39.0 \
+            golang.org/x/net@v0.58.0 \
+            golang.org/x/text@v0.41.0 \
             google.golang.org/grpc@v1.83.2
 
           go mod tidy
 
           echo
           echo "Final Kubernetes dependency versions:"
+
           go list -m all | grep -E \
             'golang.org/x/(mod|net|text|crypto)|google.golang.org/grpc' \
             || true
 
       # ---------------------------------------------------------
-      # Show dependency diff
+      # Show dependency changes
       # ---------------------------------------------------------
       - name: Show dependency changes
         shell: bash
@@ -268,12 +273,9 @@ jobs:
       # ---------------------------------------------------------
       # Run Docker deployment Go tests
       #
-      # Kubernetes tests are excluded because the previous run
-      # failed due to missing Kubernetes test infrastructure:
-      #   - ../../bin/k8s
-      #   - /usr/local/kubebuilder/bin/etcd
-      #
-      # This does NOT remove Kubernetes dependency remediation.
+      # Kubernetes tests are intentionally excluded because
+      # the previous run failed due to missing Kubernetes
+      # test infrastructure.
       # ---------------------------------------------------------
       - name: Run Docker deployment Go tests
         shell: bash
@@ -318,11 +320,9 @@ jobs:
           govulncheck -version || true
 
       # ---------------------------------------------------------
-      # Run govulncheck against Docker components
+      # Run govulncheck
       #
-      # govulncheck provides reachability-aware Go vulnerability
-      # analysis and is more useful than simply checking module
-      # versions.
+      # Report-only for this remediation phase.
       # ---------------------------------------------------------
       - name: Run govulncheck
         shell: bash
@@ -382,8 +382,7 @@ jobs:
             echo "One or more govulncheck reports contain findings or execution errors."
           fi
 
-          # Report-only for now.
-          # Do not fail the remediation workflow automatically.
+          # Report-only during remediation.
           exit 0
 
       # ---------------------------------------------------------
@@ -451,6 +450,8 @@ jobs:
 
           fi
 
+          echo
+          echo "Changes to be committed:"
           git status --short
 
           git add \
