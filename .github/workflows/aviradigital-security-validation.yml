@@ -412,7 +412,7 @@ jobs:
         with:
           name: secrets-scan-report
           path: secret-scan-report.json
-          if-no-files-found: warn          
+          if-no-files-found: warn
 
   sast-scan:
     name: SAST - CodeQL
@@ -443,7 +443,7 @@ jobs:
       - name: Analyze with CodeQL
         uses: github/codeql-action/analyze@v3
         with:
-          category: "/language:${{ matrix.language }}"          
+          category: "/language:${{ matrix.language }}"
 
   suspicious-code-binary-scan:
     name: Suspicious Code and Binary Scan
@@ -533,6 +533,7 @@ jobs:
             --glob '!**/node_modules/**' \
             --glob '!**/.venv/**' \
             --glob '!**/venv/**' \
+            --glob '!**/__pycache__/**' \
             'https?://|requests\.(get|post)|urllib\.request|httpx\.(get|post)|wget[[:space:]]|curl[[:space:]]' \
             . \
             > security-inspection/external-downloads.txt
@@ -651,7 +652,7 @@ jobs:
         with:
           name: suspicious-code-binary-report
           path: security-inspection/
-          if-no-files-found: warn          
+          if-no-files-found: warn
 
   dockerfile-security-scan:
     name: Dockerfile Security Scan
@@ -747,7 +748,7 @@ jobs:
         with:
           name: dockerfile-security-report
           path: docker-security/
-          if-no-files-found: warn          
+          if-no-files-found: warn
 
   docker-image-security-scan:
     name: Docker Image Security Scan
@@ -769,6 +770,84 @@ jobs:
             --tag opensandbox-server:security-validation \
             server
 
+      # --------------------------------------------------
+      # Python dependency diagnostic
+      # --------------------------------------------------
+      - name: Inspect Python packages in image
+        run: |
+          set -e
+
+          echo "=============================================="
+          echo "Python Dependency Diagnostic"
+          echo "=============================================="
+
+          echo ""
+          echo "Checking jaraco.context..."
+          docker run --rm \
+            opensandbox-server:security-validation \
+            python -m pip show jaraco.context || true
+
+          echo ""
+          echo "Checking wheel..."
+          docker run --rm \
+            opensandbox-server:security-validation \
+            python -m pip show wheel || true
+
+          echo ""
+          echo "Checking installed Python packages..."
+          docker run --rm \
+            opensandbox-server:security-validation \
+            python -m pip list
+
+          echo ""
+          echo "Inspecting dependency metadata..."
+          docker run --rm \
+            opensandbox-server:security-validation \
+            python -c '
+          import importlib.metadata
+
+          packages = [
+              "jaraco.context",
+              "wheel"
+          ]
+
+          for package in packages:
+              print("")
+              print("=" * 60)
+              print(f"PACKAGE: {package}")
+              print("=" * 60)
+
+              try:
+                  version = importlib.metadata.version(package)
+                  print(f"Version: {version}")
+
+                  metadata = importlib.metadata.metadata(package)
+
+                  print(f"Name: {metadata.get(\"Name\")}")
+                  print(f"Version: {metadata.get(\"Version\")}")
+
+                  requirements = metadata.get_all("Requires-Dist") or []
+
+                  print("Requires-Dist:")
+
+                  if requirements:
+                      for requirement in requirements:
+                          print(f"  - {requirement}")
+                  else:
+                      print("  None")
+
+              except importlib.metadata.PackageNotFoundError:
+                  print("NOT INSTALLED")
+
+              except Exception as exc:
+                  print(f"Metadata inspection failed: {exc}")
+          '
+
+          echo ""
+          echo "=============================================="
+          echo "Diagnostic completed"
+          echo "=============================================="
+
       - name: Generate image SBOM
         uses: anchore/sbom-action@v0
         with:
@@ -783,6 +862,7 @@ jobs:
           name: opensandbox-image-sbom
           path: sbom-opensandbox-server.json
           retention-days: 7
+          if-no-files-found: warn
 
       - name: Install Trivy
         run: |
