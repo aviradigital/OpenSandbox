@@ -1,0 +1,231 @@
+name: Go Dependency Security Remediation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/security-go-remediation
+
+permissions:
+  contents: write
+
+jobs:
+  remediate-go-dependencies:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout remediation branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/security-go-remediation
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+
+      - name: Show Go version
+        run: |
+          go version
+
+      - name: Update vulnerable Go dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          update_module() {
+            local module_dir="$1"
+            shift
+
+            echo "========================================"
+            echo "Updating module: ${module_dir}"
+            echo "========================================"
+
+            cd "${module_dir}"
+
+            for dependency in "$@"; do
+              echo "Updating ${dependency}"
+              go get "${dependency}"
+            done
+
+            go mod tidy
+
+            cd - >/dev/null
+          }
+
+          # Egress
+          update_module \
+            components/egress \
+            golang.org/x/mod@v0.40.0 \
+            golang.org/x/net@v0.56.0 \
+            golang.org/x/text@v0.39.0 \
+            google.golang.org/grpc@v1.83.2
+
+          # Execd
+          update_module \
+            components/execd \
+            golang.org/x/crypto@v0.55.0 \
+            golang.org/x/net@v0.56.0 \
+            golang.org/x/text@v0.39.0 \
+            google.golang.org/grpc@v1.83.2
+
+          # Ingress
+          update_module \
+            components/ingress \
+            golang.org/x/net@v0.56.0 \
+            golang.org/x/text@v0.39.0 \
+            google.golang.org/grpc@v1.83.2
+
+          # Internal
+          update_module \
+            components/internal \
+            golang.org/x/net@v0.56.0 \
+            golang.org/x/text@v0.39.0 \
+            google.golang.org/grpc@v1.83.2
+
+          # Nodeagent
+          update_module \
+            components/nodeagent \
+            golang.org/x/net@v0.56.0 \
+            golang.org/x/text@v0.39.0 \
+            google.golang.org/grpc@v1.83.2
+
+          # Kubernetes module
+          update_module \
+            kubernetes \
+            golang.org/x/net@v0.56.0 \
+            golang.org/x/text@v0.39.0 \
+            google.golang.org/grpc@v1.83.2
+
+      - name: Show dependency changes
+        run: |
+          echo "========================================"
+          echo "Git diff"
+          echo "========================================"
+
+          git diff -- \
+            '*/go.mod' \
+            '*/go.sum'
+
+      - name: Run Go tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          modules=(
+            components/egress
+            components/execd
+            components/ingress
+            components/internal
+            components/nodeagent
+            kubernetes
+          )
+
+          for module in "${modules[@]}"; do
+            echo "========================================"
+            echo "Testing ${module}"
+            echo "========================================"
+
+            cd "${module}"
+            go test ./...
+            cd - >/dev/null
+          done
+
+      - name: Install govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Run govulncheck
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p security-reports
+
+          modules=(
+            components/egress
+            components/execd
+            components/ingress
+            components/internal
+            components/nodeagent
+            kubernetes
+          )
+
+          overall_status=0
+
+          for module in "${modules[@]}"; do
+            module_name=$(echo "${module}" | tr '/' '-')
+
+            echo "========================================"
+            echo "govulncheck: ${module}"
+            echo "========================================"
+
+            cd "${module}"
+
+            govulncheck ./... \
+              > "../security-reports/${module_name}-govulncheck.txt" 2>&1
+
+            status=$?
+
+            if [ "${status}" -ne 0 ]; then
+              overall_status=1
+            fi
+
+            cd - >/dev/null
+          done
+
+          echo "========================================"
+          echo "govulncheck reports"
+          echo "========================================"
+
+          cat security-reports/*-govulncheck.txt
+
+          # Do not fail here.
+          # We want the reports available before deciding whether
+          # additional remediation is required.
+          exit 0
+
+      - name: Upload govulncheck reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-remediation-govulncheck
+          path: security-reports/
+          retention-days: 14
+
+      - name: Commit dependency remediation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- \
+            '*/go.mod' \
+            '*/go.sum'; then
+
+            echo "No dependency changes detected."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            components/egress/go.mod \
+            components/egress/go.sum \
+            components/execd/go.mod \
+            components/execd/go.sum \
+            components/ingress/go.mod \
+            components/ingress/go.sum \
+            components/internal/go.mod \
+            components/internal/go.sum \
+            components/nodeagent/go.mod \
+            components/nodeagent/go.sum \
+            kubernetes/go.mod \
+            kubernetes/go.sum
+
+          git commit \
+            -m "security: remediate vulnerable Go dependencies"
+
+          git push origin feature/security-go-remediation
