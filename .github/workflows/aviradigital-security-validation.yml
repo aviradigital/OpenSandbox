@@ -10,6 +10,10 @@ permissions:
   contents: read
 
 jobs:
+
+  # ==========================================================
+  # 1. LICENSE & DEPENDENCY SCAN
+  # ==========================================================
   license-dependency-scan:
     name: License & Dependency Scan
     runs-on: ubuntu-latest
@@ -162,11 +166,16 @@ jobs:
           path: license-policy-report.json
           retention-days: 7
 
+
+  # ==========================================================
+  # 2. DEPENDENCY VULNERABILITY SCAN
+  # ==========================================================
   vulnerability-scan:
     name: Dependency Vulnerability Scan
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -296,11 +305,16 @@ jobs:
           path: trivy-vulnerability-report.json
           retention-days: 7
 
+
+  # ==========================================================
+  # 3. SECRETS SCAN
+  # ==========================================================
   secrets-scan:
     name: Secrets Scan
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -414,6 +428,10 @@ jobs:
           path: secret-scan-report.json
           if-no-files-found: warn
 
+
+  # ==========================================================
+  # 4. SAST - CODEQL
+  # ==========================================================
   sast-scan:
     name: SAST - CodeQL
     runs-on: ubuntu-latest
@@ -431,6 +449,7 @@ jobs:
           - javascript-typescript
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -445,11 +464,16 @@ jobs:
         with:
           category: "/language:${{ matrix.language }}"
 
+
+  # ==========================================================
+  # 5. SUSPICIOUS CODE / BINARY SCAN
+  # ==========================================================
   suspicious-code-binary-scan:
     name: Suspicious Code and Binary Scan
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -519,6 +543,8 @@ jobs:
             --hidden \
             --glob '!.git/**' \
             --glob '!**/node_modules/**' \
+            --glob '!**/.venv/**' \
+            --glob '!**/venv/**' \
             'chmod[[:space:]]+\+x|chmod[[:space:]]+777|install[[:space:]]+-m[[:space:]]+777' \
             . \
             > security-inspection/permission-changes.txt
@@ -654,11 +680,16 @@ jobs:
           path: security-inspection/
           if-no-files-found: warn
 
+
+  # ==========================================================
+  # 6. DOCKERFILE SECURITY SCAN
+  # ==========================================================
   dockerfile-security-scan:
     name: Dockerfile Security Scan
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -695,7 +726,11 @@ jobs:
           python3 <<'PY'
           import json
 
-          with open("dockerfile-trivy-report.json", "r", encoding="utf-8") as f:
+          with open(
+              "dockerfile-trivy-report.json",
+              "r",
+              encoding="utf-8"
+          ) as f:
               data = json.load(f)
 
           findings = []
@@ -703,7 +738,9 @@ jobs:
           for result in data.get("Results", []):
               target = result.get("Target", "")
 
-              for misconfig in result.get("Misconfigurations", []) or []:
+              for misconfig in result.get(
+                  "Misconfigurations", []
+              ) or []:
                   findings.append({
                       "id": misconfig.get("ID"),
                       "severity": misconfig.get("Severity"),
@@ -729,7 +766,10 @@ jobs:
           print("")
           print("Dockerfile Security Summary")
           print("============================")
-          print(f"Total HIGH/CRITICAL findings: {len(findings)}")
+          print(
+              f"Total HIGH/CRITICAL findings: "
+              f"{len(findings)}"
+          )
 
           for item in findings:
               print(
@@ -750,6 +790,10 @@ jobs:
           path: docker-security/
           if-no-files-found: warn
 
+
+  # ==========================================================
+  # 7. DOCKER IMAGE SECURITY SCAN
+  # ==========================================================
   docker-image-security-scan:
     name: Docker Image Security Scan
     runs-on: ubuntu-latest
@@ -758,9 +802,13 @@ jobs:
       contents: read
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # --------------------------------------------------
+      # Build image
+      # --------------------------------------------------
       - name: Build OpenSandbox server image
         run: |
           set -e
@@ -772,10 +820,18 @@ jobs:
 
       # --------------------------------------------------
       # Python dependency diagnostic
+      #
+      # IMPORTANT:
+      # The OpenSandbox image has an ENTRYPOINT of
+      # opensandbox-server.
+      #
+      # Therefore we must override the ENTRYPOINT when
+      # executing Python commands inside the image.
       # --------------------------------------------------
       - name: Inspect Python packages in image
+        if: always()
         run: |
-          set -e
+          set +e
 
           echo "=============================================="
           echo "Python Dependency Diagnostic"
@@ -784,26 +840,31 @@ jobs:
           echo ""
           echo "Checking jaraco.context..."
           docker run --rm \
+            --entrypoint python \
             opensandbox-server:security-validation \
-            python -m pip show jaraco.context || true
+            -m pip show jaraco.context
 
           echo ""
           echo "Checking wheel..."
           docker run --rm \
+            --entrypoint python \
             opensandbox-server:security-validation \
-            python -m pip show wheel || true
+            -m pip show wheel
 
           echo ""
           echo "Checking installed Python packages..."
           docker run --rm \
+            --entrypoint python \
             opensandbox-server:security-validation \
-            python -m pip list
+            -m pip list
 
           echo ""
           echo "Inspecting dependency metadata..."
+
           docker run --rm \
+            --entrypoint python \
             opensandbox-server:security-validation \
-            python -c '
+            -c '
           import importlib.metadata
 
           packages = [
@@ -826,7 +887,9 @@ jobs:
                   print(f"Name: {metadata.get(\"Name\")}")
                   print(f"Version: {metadata.get(\"Version\")}")
 
-                  requirements = metadata.get_all("Requires-Dist") or []
+                  requirements = metadata.get_all(
+                      "Requires-Dist"
+                  ) or []
 
                   print("Requires-Dist:")
 
@@ -848,6 +911,13 @@ jobs:
           echo "Diagnostic completed"
           echo "=============================================="
 
+          # Diagnostic only.
+          # Never block SBOM or vulnerability scanning.
+          exit 0
+
+      # --------------------------------------------------
+      # Generate image SBOM
+      # --------------------------------------------------
       - name: Generate image SBOM
         uses: anchore/sbom-action@v0
         with:
@@ -856,6 +926,9 @@ jobs:
           output-file: sbom-opensandbox-server.json
           upload-artifact: false
 
+      # --------------------------------------------------
+      # Upload image SBOM
+      # --------------------------------------------------
       - name: Upload image SBOM
         uses: actions/upload-artifact@v4
         with:
@@ -864,6 +937,9 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
+      # --------------------------------------------------
+      # Install Trivy
+      # --------------------------------------------------
       - name: Install Trivy
         run: |
           set -e
@@ -879,6 +955,9 @@ jobs:
 
           trivy --version
 
+      # --------------------------------------------------
+      # Scan Docker image
+      # --------------------------------------------------
       - name: Scan Docker image
         run: |
           set +e
@@ -897,7 +976,11 @@ jobs:
           import json
           from collections import Counter
 
-          with open("trivy-image-raw.json", "r", encoding="utf-8") as f:
+          with open(
+              "trivy-image-raw.json",
+              "r",
+              encoding="utf-8"
+          ) as f:
               data = json.load(f)
 
           findings = []
@@ -905,13 +988,21 @@ jobs:
           for result in data.get("Results", []):
               target = result.get("Target", "")
 
-              for vuln in result.get("Vulnerabilities", []) or []:
+              for vuln in result.get(
+                  "Vulnerabilities", []
+              ) or []:
                   findings.append({
-                      "vulnerability_id": vuln.get("VulnerabilityID"),
+                      "vulnerability_id": vuln.get(
+                          "VulnerabilityID"
+                      ),
                       "severity": vuln.get("Severity"),
                       "package": vuln.get("PkgName"),
-                      "installed_version": vuln.get("InstalledVersion"),
-                      "fixed_version": vuln.get("FixedVersion"),
+                      "installed_version": vuln.get(
+                          "InstalledVersion"
+                      ),
+                      "fixed_version": vuln.get(
+                          "FixedVersion"
+                      ),
                       "target": target,
                       "title": vuln.get("Title")
                   })
@@ -932,7 +1023,8 @@ jobs:
           }
 
           with open(
-              "docker-image-security/docker-image-security-report.json",
+              "docker-image-security/"
+              "docker-image-security-report.json",
               "w",
               encoding="utf-8"
           ) as f:
@@ -942,9 +1034,18 @@ jobs:
           print("========================================")
           print("Docker Image Security Summary")
           print("========================================")
-          print(f"Total HIGH/CRITICAL : {len(findings)}")
-          print(f"CRITICAL           : {counts.get('CRITICAL', 0)}")
-          print(f"HIGH               : {counts.get('HIGH', 0)}")
+          print(
+              f"Total HIGH/CRITICAL : "
+              f"{len(findings)}"
+          )
+          print(
+              f"CRITICAL           : "
+              f"{counts.get('CRITICAL', 0)}"
+          )
+          print(
+              f"HIGH               : "
+              f"{counts.get('HIGH', 0)}"
+          )
 
           for finding in findings:
               print(
@@ -958,6 +1059,9 @@ jobs:
 
           rm -f trivy-image-raw.json
 
+      # --------------------------------------------------
+      # Upload Docker image security report
+      # --------------------------------------------------
       - name: Upload Docker image report
         if: always()
         uses: actions/upload-artifact@v4
