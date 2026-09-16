@@ -100,10 +100,10 @@ PY
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/opensandbox_server /app/opensandbox_server
 
-# Preserve the upstream runtime files for now. Docker deployment configuration
-# should be switched from the Kubernetes example in a separate reviewed change.
-COPY --from=builder /app/opensandbox_server/examples/example.config.k8s.toml /etc/opensandbox/config.toml
-COPY --from=builder /app/opensandbox_server/examples/example.config.k8s.zh.toml /etc/opensandbox/config.zh.toml
+# Use the Docker runtime configuration for this Docker deployment.
+# The Kubernetes example is intentionally not used by the Docker image.
+COPY --from=builder /app/opensandbox_server/examples/example.config.toml /etc/opensandbox/config.toml
+COPY --from=builder /app/opensandbox_server/examples/example.config.zh.toml /etc/opensandbox/config.zh.toml
 COPY --from=builder /app/opensandbox_server/examples/example.batchsandbox-template.yaml /etc/opensandbox/example.batchsandbox-template.yaml
 COPY --from=builder /app/opensandbox_server/examples/e2e.batchsandbox-template.yaml /etc/opensandbox/e2e.batchsandbox-template.yaml
 
