@@ -1117,28 +1117,31 @@ jobs:
           echo "=============================================="
 
       # --------------------------------------------------
-      # Install Trivy in THIS job. Each GitHub Actions job runs
-      # on a separate runner, so Trivy from another job is not
-      # available here.
+      # Install Trivy before Docker image scan
       # --------------------------------------------------
       - name: Install Trivy for Docker image scan
         run: |
           set -euo pipefail
 
           TRIVY_VERSION="0.74.0"
-          TRIVY_BIN="$HOME/.local/bin"
+          INSTALL_DIR="$HOME/.local/bin"
+          ARCHIVE="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${ARCHIVE}"
 
-          mkdir -p "$TRIVY_BIN"
+          mkdir -p "$INSTALL_DIR"
 
-          curl -sfL \
-            "https://raw.githubusercontent.com/aquasecurity/trivy/v${TRIVY_VERSION}/install.sh" \
-            | sh -s -- -b "$TRIVY_BIN" "v${TRIVY_VERSION}"
+          echo "Installing Trivy ${TRIVY_VERSION}..."
+          echo "Download: $URL"
 
-          echo "$TRIVY_BIN" >> "$GITHUB_PATH"
-          export PATH="$TRIVY_BIN:$PATH"
+          curl -fL --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/$ARCHIVE" "$URL"
+          tar -xzf "$RUNNER_TEMP/$ARCHIVE" -C "$RUNNER_TEMP" trivy
+          install -m 0755 "$RUNNER_TEMP/trivy" "$INSTALL_DIR/trivy"
+
+          export PATH="$INSTALL_DIR:$PATH"
+          echo "$INSTALL_DIR" >> "$GITHUB_PATH"
 
           echo "Trivy version:"
-          trivy --version
+          "$INSTALL_DIR/trivy" --version
 
       # --------------------------------------------------
       - name: Scan, classify and gate Docker image
