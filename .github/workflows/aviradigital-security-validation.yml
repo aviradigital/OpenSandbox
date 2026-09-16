@@ -833,86 +833,105 @@ jobs:
         run: |
           set +e
 
+          IMAGE="opensandbox-server:security-validation"
+
           echo "=============================================="
           echo "Python Dependency Diagnostic"
           echo "=============================================="
 
           echo ""
+          echo "Python version:"
+          docker run --rm \
+            --entrypoint /app/.venv/bin/python \
+            "$IMAGE" \
+            --version
+
+          echo ""
           echo "Checking jaraco.context..."
           docker run --rm \
-            --entrypoint python \
-            opensandbox-server:security-validation \
-            -m pip show jaraco.context
+            --entrypoint /app/.venv/bin/python \
+            "$IMAGE" \
+            -c '
+          import importlib.metadata as metadata
+
+          package = "jaraco.context"
+
+          try:
+              dist = metadata.distribution(package)
+
+              print("FOUND")
+              print("Name:", dist.metadata.get("Name"))
+              print("Version:", dist.version)
+              print("Location:", dist.locate_file(""))
+              print("Requires-Dist:")
+
+              requirements = dist.requires or []
+
+              if requirements:
+                  for req in requirements:
+                      print("  ", req)
+              else:
+                  print("   None")
+
+          except metadata.PackageNotFoundError:
+              print("NOT FOUND")
+          '
 
           echo ""
           echo "Checking wheel..."
           docker run --rm \
-            --entrypoint python \
-            opensandbox-server:security-validation \
-            -m pip show wheel
-
-          echo ""
-          echo "Checking installed Python packages..."
-          docker run --rm \
-            --entrypoint python \
-            opensandbox-server:security-validation \
-            -m pip list
-
-          echo ""
-          echo "Inspecting dependency metadata..."
-
-          docker run --rm \
-            --entrypoint python \
-            opensandbox-server:security-validation \
+            --entrypoint /app/.venv/bin/python \
+            "$IMAGE" \
             -c '
-          import importlib.metadata
+          import importlib.metadata as metadata
 
-          packages = [
-              "jaraco.context",
-              "wheel"
-          ]
+          package = "wheel"
 
-          for package in packages:
-              print("")
-              print("=" * 60)
-              print(f"PACKAGE: {package}")
-              print("=" * 60)
+          try:
+              dist = metadata.distribution(package)
 
-              try:
-                  version = importlib.metadata.version(package)
-                  print(f"Version: {version}")
+              print("FOUND")
+              print("Name:", dist.metadata.get("Name"))
+              print("Version:", dist.version)
+              print("Location:", dist.locate_file(""))
+              print("Requires-Dist:")
 
-                  metadata = importlib.metadata.metadata(package)
+              requirements = dist.requires or []
 
-                  print(f"Name: {metadata.get(\"Name\")}")
-                  print(f"Version: {metadata.get(\"Version\")}")
+              if requirements:
+                  for req in requirements:
+                      print("  ", req)
+              else:
+                  print("   None")
 
-                  requirements = metadata.get_all(
-                      "Requires-Dist"
-                  ) or []
+          except metadata.PackageNotFoundError:
+              print("NOT FOUND")
+          '
 
-                  print("Requires-Dist:")
+          echo ""
+          echo "Installed Python distributions:"
+          docker run --rm \
+            --entrypoint /app/.venv/bin/python \
+            "$IMAGE" \
+            -c '
+          import importlib.metadata as metadata
 
-                  if requirements:
-                      for requirement in requirements:
-                          print(f"  - {requirement}")
-                  else:
-                      print("  None")
+          packages = sorted(
+              metadata.distributions(),
+              key=lambda d: (d.metadata.get("Name") or "").lower()
+          )
 
-              except importlib.metadata.PackageNotFoundError:
-                  print("NOT INSTALLED")
-
-              except Exception as exc:
-                  print(f"Metadata inspection failed: {exc}")
+          for dist in packages:
+              name = dist.metadata.get("Name") or "UNKNOWN"
+              version = dist.version or "UNKNOWN"
+              print(f"{name}=={version}")
           '
 
           echo ""
           echo "=============================================="
-          echo "Diagnostic completed"
+          echo "Dependency diagnostic completed"
           echo "=============================================="
 
-          # Diagnostic only.
-          # Never block SBOM or vulnerability scanning.
           exit 0
 
       # --------------------------------------------------
