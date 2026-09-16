@@ -16,15 +16,11 @@
 # - Keep the upstream build context as server/
 # - Pin the Python base image by digest
 # - Apply Debian security updates explicitly
-# - Update Python packaging tooling
+# - Update system Python packaging tooling so vulnerable vendored copies
+#   of jaraco.context/wheel are not retained in the final image
 # - Keep the existing application/runtime layout unchanged
 
 ARG PYTHON_BASE=python:3.10-slim@sha256:8c97ebedc32fd60935cdf5992e935753e2a0f98231830028050e1e04bd3c13c2
-
-
-# ============================================================
-# Builder
-# ============================================================
 
 FROM ${PYTHON_BASE} AS builder
 
@@ -35,11 +31,6 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     UV_LINK_MODE=copy
 
 WORKDIR /app
-
-
-# ------------------------------------------------------------
-# Debian security updates
-# ------------------------------------------------------------
 
 RUN apt-get update \
     && apt-get upgrade -y \
@@ -53,56 +44,24 @@ RUN apt-get update \
         perl-base \
     && rm -rf /var/lib/apt/lists/*
 
-
-# ------------------------------------------------------------
-# Install uv
-# ------------------------------------------------------------
-
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
-
-
-# ------------------------------------------------------------
-# Install application dependencies
-# ------------------------------------------------------------
 
 COPY pyproject.toml uv.lock ./
 
 RUN uv sync --frozen --no-dev --no-install-project
 
-
-# ------------------------------------------------------------
-# Copy application source
-# ------------------------------------------------------------
-
 COPY opensandbox_server ./opensandbox_server
 
 COPY LICENSE README.md ./
 
-
-# ------------------------------------------------------------
-# Install OpenSandbox server
-# ------------------------------------------------------------
-
 RUN uv pip install --no-deps --editable .
 
-
-# ------------------------------------------------------------
-# Update Python packaging dependencies
-# ------------------------------------------------------------
-
-RUN uv pip install \
-        --python /app/.venv/bin/python \
-        --upgrade \
+# Keep application environment packaging tools current as well.
+RUN uv pip install --python /app/.venv/bin/python --upgrade \
         "setuptools>=82.0.1" \
         "wheel>=0.46.2"
-
-
-
-# ============================================================
-# Runtime
-# ============================================================
 
 FROM ${PYTHON_BASE} AS runtime
 
@@ -115,11 +74,7 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 
 WORKDIR /app
 
-
-# ------------------------------------------------------------
-# Debian security updates in FINAL runtime image
-# ------------------------------------------------------------
-
+# Apply Debian security updates in the final runtime image.
 RUN apt-get update \
     && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
@@ -131,102 +86,49 @@ RUN apt-get update \
         perl-base \
     && rm -rf /var/lib/apt/lists/*
 
-
-# ------------------------------------------------------------
-# Update system Python packaging tools
-#
-# Trivy previously detected:
-#   CVE-2026-23949 -> jaraco.context
-#   CVE-2026-24049 -> wheel
-#
-# These were associated with Python packaging tooling in the
-# base image.
-# ------------------------------------------------------------
-
-RUN python -m pip install \
-        --no-cache-dir \
-        --upgrade \
+# Refresh system packaging tooling. The base image contains setuptools with
+# vendored jaraco.context/wheel copies that were reported by Trivy.
+RUN python -m pip install --no-cache-dir --upgrade \
         "setuptools>=82.0.1" \
-        "wheel>=0.46.2"
-
-
-# ------------------------------------------------------------
-# Copy application from builder
-# ------------------------------------------------------------
+        "wheel>=0.46.2" \
+    && python - <<'PY'
+import importlib.metadata as md
+for name in ("setuptools", "wheel"):
+    print(f"{name}: {md.version(name)}")
+PY
 
 COPY --from=builder /app/.venv /app/.venv
-
 COPY --from=builder /app/opensandbox_server /app/opensandbox_server
 
-
-# ------------------------------------------------------------
-# Preserve existing OpenSandbox runtime files
-#
-# NOTE:
-# The current upstream Dockerfile uses the Kubernetes example
-# configuration. We are deliberately NOT changing that in this
-# vulnerability-remediation change.
-#
-# Docker-vs-Kubernetes configuration will be reviewed separately.
-# ------------------------------------------------------------
-
+# Preserve the upstream runtime files for now. Docker deployment configuration
+# should be switched from the Kubernetes example in a separate reviewed change.
 COPY --from=builder /app/opensandbox_server/examples/example.config.k8s.toml /etc/opensandbox/config.toml
-
 COPY --from=builder /app/opensandbox_server/examples/example.config.k8s.zh.toml /etc/opensandbox/config.zh.toml
-
 COPY --from=builder /app/opensandbox_server/examples/example.batchsandbox-template.yaml /etc/opensandbox/example.batchsandbox-template.yaml
-
 COPY --from=builder /app/opensandbox_server/examples/e2e.batchsandbox-template.yaml /etc/opensandbox/e2e.batchsandbox-template.yaml
 
-
-# ============================================================
-# Security verification
-# ============================================================
+# Print package versions during the image build so the security pipeline has
+# direct evidence of the remediation.
 #
-# IMPORTANT:
-# This section is diagnostic only.
-#
-# It prints the installed package versions but does NOT fail
-# the Docker build if a package is absent.
-#
-# Trivy remains the actual security gate in GitHub Actions.
-# ============================================================
-
+# This is diagnostic only: a package that is not installed must not make the
+# Docker build fail. Trivy remains the security gate in CI.
 RUN echo "===== Debian package versions =====" \
     && for pkg in perl-base gzip libpcre2-8-0 libsqlite3-0; do \
         echo "--- $pkg ---"; \
-        dpkg-query -W \
-            -f='${Package} ${Version}\n' \
-            "$pkg" 2>/dev/null \
-            || echo "$pkg: NOT INSTALLED"; \
+        dpkg-query -W -f='${Package} ${Version}\n' "$pkg" 2>/dev/null || echo "$pkg: NOT INSTALLED"; \
     done \
     && echo "===== Python packaging versions =====" \
-    && python -m pip show setuptools 2>/dev/null \
-        || echo "setuptools: NOT FOUND" \
-    && python -m pip show wheel 2>/dev/null \
-        || echo "wheel: NOT FOUND" \
+    && python -m pip show setuptools 2>/dev/null || echo "setuptools: NOT FOUND" \
+    && python -m pip show wheel 2>/dev/null || echo "wheel: NOT FOUND" \
     && echo "===== Python packaging metadata =====" \
     && python -c 'import importlib.metadata as md; [print(f"{name}: {md.version(name)}") for name in ("setuptools", "wheel")]' \
     && echo "===== Vendored packaging metadata =====" \
     && find /usr/local/lib/python3.10/site-packages \
         -maxdepth 4 \
-        \( \
-            -name "jaraco.context-*.dist-info" \
-            -o -name "wheel-*.dist-info" \
-        \) \
+        \( -name 'jaraco.context-*.dist-info' -o -name 'wheel-*.dist-info' \) \
         -print || true
 
-
-# ------------------------------------------------------------
-# Application port
-# ------------------------------------------------------------
-
 EXPOSE 8080
-
-
-# ------------------------------------------------------------
-# OpenSandbox startup
-# ------------------------------------------------------------
 
 ENTRYPOINT ["opensandbox-server"]
 
