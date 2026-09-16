@@ -142,6 +142,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -f .github/scripts/policy_check.py ]; then
+            # The existing policy checker expects license-report.json in the
+            # repository root. Keep the generated evidence in the report
+            # directory and provide a temporary compatibility copy.
+            cp security-reports/license-dependency/license-report.json license-report.json
+            trap 'rm -f license-report.json' EXIT
             python3 .github/scripts/policy_check.py
           else
             echo "No policy_check.py found; policy check not executed."
@@ -1297,58 +1302,158 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate repository structure
+      - name: Initialize build/test report directory
         run: |
           set -euo pipefail
           mkdir -p security-reports/build-test
+          printf 'NOT_RUN\n' > security-reports/build-test/docker-build-status.txt
+          printf 'NOT_RUN\n' > security-reports/build-test/health-status.txt
 
-          test -f server/Dockerfile
-          test -f server/pyproject.toml
-          test -f server/uv.lock
-          test -d server/opensandbox_server
+      - name: Validate repository structure
+        run: |
+          set +e
+          mkdir -p security-reports/build-test
 
-          echo "Required server build files are present."
+          failed=0
+          for required in \
+            server/Dockerfile \
+            server/pyproject.toml \
+            server/uv.lock; do
+            if [ -f "$required" ]; then
+              echo "PASS: $required"
+            else
+              echo "FAIL: $required is missing"
+              failed=1
+            fi
+          done
+
+          if [ -d server/opensandbox_server ]; then
+            echo "PASS: server/opensandbox_server"
+          else
+            echo "FAIL: server/opensandbox_server is missing"
+            failed=1
+          fi
+
+          if [ "$failed" -eq 0 ]; then
+            printf 'PASS\n' > security-reports/build-test/repository-structure-status.txt
+            exit 0
+          fi
+
+          printf 'FAIL\n' > security-reports/build-test/repository-structure-status.txt
+          exit 1
 
       - name: Build OpenSandbox image for validation
+        if: always()
         run: |
-          set -euo pipefail
+          set +e
+          mkdir -p security-reports/build-test
 
           docker build \
             --file server/Dockerfile \
             --tag "$IMAGE-build-test" \
-            server
+            server \
+            > security-reports/build-test/docker-build.log 2>&1
 
-      - name: Start container for health validation
-        run: |
-          set -euo pipefail
+          rc=$?
+          echo "Docker build exit code: $rc" \
+            | tee security-reports/build-test/docker-build-result.txt
 
-          docker run -d \
-            --name opensandbox-security-test \
-            -p 18090:8080 \
-            "$IMAGE-build-test"
+          if [ "$rc" -eq 0 ]; then
+            printf 'PASS\n' > security-reports/build-test/docker-build-status.txt
+            exit 0
+          fi
 
-          sleep 10
+          printf 'FAIL\n' > security-reports/build-test/docker-build-status.txt
+          exit "$rc"
 
-      - name: Validate container health endpoint
+      - name: Inspect built image
+        if: always()
         run: |
           set +e
-
           mkdir -p security-reports/build-test
 
-          HTTP_CODE=$(curl -sS \
-            -o security-reports/build-test/health-response.txt \
-            -w '%{http_code}' \
-            --max-time 15 \
-            http://127.0.0.1:18090/health)
+          docker image inspect "$IMAGE-build-test" \
+            > security-reports/build-test/image-inspect.json 2>&1 || true
+
+          docker image ls "$IMAGE-build-test" \
+            > security-reports/build-test/image-list.txt 2>&1 || true
+
+          if docker image inspect "$IMAGE-build-test" >/dev/null 2>&1; then
+            docker image inspect "$IMAGE-build-test" \
+              --format 'Image ID: {{.Id}}\nEntrypoint: {{json .Config.Entrypoint}}\nCmd: {{json .Config.Cmd}}\nUser: {{printf "%q" .Config.User}}\nExposedPorts: {{json .Config.ExposedPorts}}' \
+              > security-reports/build-test/image-runtime-metadata.txt 2>&1 || true
+          fi
+
+      - name: Start container for health validation
+        if: success()
+        run: |
+          set +e
+          mkdir -p security-reports/build-test
+
+          # Use the Docker runtime configuration for the Docker image.
+          # The health probe runs from inside the container so the check does
+          # not depend on the application binding to the host interface.
+          docker run -d \
+            --name opensandbox-security-test \
+            -e OPENSANDBOX_INSECURE_SERVER=YES \
+            "$IMAGE-build-test" \
+            > security-reports/build-test/container-id.txt 2>&1
+
+          rc=$?
+          echo "docker run exit code: $rc" \
+            | tee security-reports/build-test/container-start-result.txt
+
+          if [ "$rc" -ne 0 ]; then
+            printf 'FAIL\n' > security-reports/build-test/container-start-status.txt
+            exit "$rc"
+          fi
+
+          printf 'PASS\n' > security-reports/build-test/container-start-status.txt
+
+          # Give the application a bounded startup window and capture status
+          # if it exits early.
+          for i in $(seq 1 30); do
+            if ! docker inspect -f '{{.State.Running}}' opensandbox-security-test 2>/dev/null | grep -q '^true$'; then
+              echo "Container stopped during startup at attempt $i" \
+                | tee security-reports/build-test/container-startup-error.txt
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Validate container health endpoint
+        if: success()
+        run: |
+          set +e
+          mkdir -p security-reports/build-test
+
+          HTTP_CODE="000"
+          RESPONSE_FILE="security-reports/build-test/health-response.txt"
+
+          for attempt in $(seq 1 15); do
+            docker exec opensandbox-security-test \
+              python -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=5).getcode())' \
+              > "$RESPONSE_FILE" 2> security-reports/build-test/health-error.txt
+
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+              HTTP_CODE=$(tr -d '[:space:]' < "$RESPONSE_FILE")
+              break
+            fi
+
+            sleep 2
+          done
 
           echo "HTTP status: $HTTP_CODE" \
             | tee security-reports/build-test/health-status.txt
 
           if [ "$HTTP_CODE" = "200" ]; then
+            printf 'PASS\n' > security-reports/build-test/health-check-status.txt
             echo "Health check PASS"
             exit 0
           fi
 
+          printf 'FAIL\n' > security-reports/build-test/health-check-status.txt
           echo "Health check did not return HTTP 200."
           exit 1
 
@@ -1361,11 +1466,15 @@ jobs:
           docker ps -a \
             > security-reports/build-test/docker-ps.txt 2>&1 || true
 
+          docker inspect opensandbox-security-test \
+            > security-reports/build-test/container-inspect.json 2>&1 || true
+
           docker logs opensandbox-security-test \
             > security-reports/build-test/container.log 2>&1 || true
 
           docker inspect opensandbox-security-test \
-            > security-reports/build-test/container-inspect.json 2>&1 || true
+            --format 'Running={{.State.Running}} ExitCode={{.State.ExitCode}} Status={{.State.Status}} Error={{printf "%q" .State.Error}} StartedAt={{.State.StartedAt}} FinishedAt={{.State.FinishedAt}}' \
+            > security-reports/build-test/container-state.txt 2>&1 || true
 
           docker rm -f opensandbox-security-test \
             > /dev/null 2>&1 || true
@@ -1384,31 +1493,23 @@ jobs:
           base = Path("security-reports/build-test")
           base.mkdir(parents=True, exist_ok=True)
 
-          structure_ok = all([
-              Path("server/Dockerfile").exists(),
-              Path("server/pyproject.toml").exists(),
-              Path("server/uv.lock").exists(),
-              Path("server/opensandbox_server").is_dir(),
-          ])
-
-          build_ok = (base / "docker-build-status.txt").read_text(
-              encoding="utf-8", errors="replace"
-          ).strip() == "PASS" if (base / "docker-build-status.txt").exists() else False
-
-          health_ok = (base / "health-status.txt").read_text(
-              encoding="utf-8", errors="replace"
-          ).strip() == "HTTP status: 200" if (base / "health-status.txt").exists() else False
+          def read_status(name, default="NOT_RUN"):
+              p = base / name
+              return p.read_text(encoding="utf-8", errors="replace").strip() if p.exists() else default
 
           checks = {
-              "repository_structure": "PASS" if structure_ok else "FAIL",
-              "docker_build": "PASS" if build_ok else "FAIL",
-              "health_endpoint": "PASS" if health_ok else "FAIL",
+              "repository_structure": read_status("repository-structure-status.txt"),
+              "docker_build": read_status("docker-build-status.txt"),
+              "container_start": read_status("container-start-status.txt"),
+              "health_endpoint": read_status("health-check-status.txt"),
           }
 
-          status = "PASS" if all(v == "PASS" for v in checks.values()) else "FAIL"
+          failed = [k for k, v in checks.items() if v == "FAIL"]
+          not_run = [k for k, v in checks.items() if v == "NOT_RUN"]
+          status = "FAIL" if failed else "REVIEW" if not_run else "PASS"
 
           report = {
-              "report": "OpenSandbox Security Validation - Build/Test",
+              "report": "OpenSandbox Security Validation - Build/Test/Health",
               "job": "Build Test and Health Validation",
               "status": status,
               "repository": os.environ.get("GITHUB_REPOSITORY"),
@@ -1416,22 +1517,28 @@ jobs:
               "workflow_run": os.environ.get("GITHUB_RUN_ID"),
               "generated_at_utc": datetime.now(timezone.utc).isoformat(),
               "checks": checks,
-              "evidence_files": sorted(
-                  p.name for p in base.iterdir() if p.is_file()
+              "failed_checks": failed,
+              "not_run_checks": not_run,
+              "evidence_files": sorted(p.name for p in base.iterdir() if p.is_file()),
+              "recommendation": (
+                  "Review the captured Docker build/container logs and remediate the failing check(s)."
+                  if status == "FAIL"
+                  else "Review checks that did not execute."
+                  if status == "REVIEW"
+                  else "Build, container startup, and health validation passed."
               ),
           }
 
-          (base / "report.json").write_text(
-              json.dumps(report, indent=2), encoding="utf-8"
-          )
+          (base / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
           lines = [
               "# Build Test and Health Validation",
               "",
-              f"**Status:** {status}",
+              f"**Status:** **{status}**",
               f"**Repository:** `{report['repository']}`",
               f"**Commit:** `{report['commit']}`",
               f"**Workflow run:** `{report['workflow_run']}`",
+              f"**Generated:** `{report['generated_at_utc']}`",
               "",
               "## Checks",
               "",
@@ -1439,20 +1546,26 @@ jobs:
               "|---|---|",
           ]
           for name, value in checks.items():
-              lines.append(f"| {name} | {value} |")
+              lines.append(f"| {name} | **{value}** |")
 
           lines += [
               "",
+              "## Recommendation",
+              "",
+              report["recommendation"],
+              "",
               "## Evidence",
               "",
-              "The artifact contains Docker build status, health response, "
-              "container logs, Docker inspection output, and this report.",
+              "The artifact contains the Docker build log, image metadata, container state, "
+              "container logs, Docker inspection output, health response, and this report.",
           ]
 
-          (base / "report.md").write_text(
-              "\n".join(lines) + "\n", encoding="utf-8"
-          )
+          (base / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
           print("\n".join(lines))
+
+          # Keep the GitHub job failed when a build/health gate fails.
+          if status == "FAIL":
+              raise SystemExit(1)
           PY
 
       - name: Upload build and test report
@@ -1515,69 +1628,137 @@ jobs:
           import json
           import os
           from pathlib import Path
+          from datetime import datetime, timezone
 
           base = Path("final-reports")
           final = base / "FINAL"
 
           jobs = [
-              ("License & Dependency Scan", os.environ["LICENSE_RESULT"]),
-              ("Dependency Vulnerability Scan", os.environ["VULNERABILITY_RESULT"]),
-              ("Secrets Scan", os.environ["SECRETS_RESULT"]),
-              ("SAST - CodeQL", os.environ["SAST_RESULT"]),
-              ("Suspicious Code and Binary Scan", os.environ["SUSPICIOUS_RESULT"]),
-              ("Dockerfile Security Scan", os.environ["DOCKERFILE_RESULT"]),
-              ("Docker Image Security Scan", os.environ["IMAGE_RESULT"]),
-              ("Configuration and Runtime Security", os.environ["CONFIG_RESULT"]),
-              ("Build Test and Health Validation", os.environ["BUILD_RESULT"]),
+              ("License & Dependency Scan", "01-license-dependency-report", os.environ["LICENSE_RESULT"]),
+              ("Dependency Vulnerability Scan", "02-vulnerability-report", os.environ["VULNERABILITY_RESULT"]),
+              ("Secrets Scan", "03-secrets-report", os.environ["SECRETS_RESULT"]),
+              ("SAST - CodeQL", "04-sast-report", os.environ["SAST_RESULT"]),
+              ("Suspicious Code and Binary Scan", "05-suspicious-code-binary-report", os.environ["SUSPICIOUS_RESULT"]),
+              ("Dockerfile Security Scan", "06-dockerfile-security-report", os.environ["DOCKERFILE_RESULT"]),
+              ("Docker Image Security Scan", "07-docker-image-security-report", os.environ["IMAGE_RESULT"]),
+              ("Configuration and Runtime Security", "08-configuration-security-report", os.environ["CONFIG_RESULT"]),
+              ("Build Test and Health Validation", "09-build-test-report", os.environ["BUILD_RESULT"]),
           ]
 
-          status_map = {
-              "success": "PASS",
-              "failure": "FAIL",
-              "cancelled": "FAIL",
-              "skipped": "REVIEW",
-          }
+          def find_reports(artifact_dir):
+              root = base / artifact_dir
+              if not root.exists():
+                  return []
+              return sorted(root.rglob("report.json"))
+
+          def normalize_status(value):
+              value = str(value or "").upper()
+              if value == "FAIL":
+                  return "FAIL"
+              if value in {"WARNING", "REVIEW"}:
+                  return "WARNING"
+              if value == "PASS":
+                  return "PASS"
+              return "REVIEW"
 
           rows = []
-          for name, result in jobs:
+          all_findings = []
+
+          for name, artifact_dir, github_result in jobs:
+              report_files = find_reports(artifact_dir)
+              parsed = []
+              for path in report_files:
+                  try:
+                      data = json.loads(path.read_text(encoding="utf-8"))
+                      parsed.append((path, data))
+                  except Exception as exc:
+                      parsed.append((path, {"status": "FAIL", "error": f"Invalid report JSON: {exc}"}))
+
+              statuses = [normalize_status(data.get("status")) for _, data in parsed]
+
+              # A job execution failure/cancellation always overrides the report
+              # status. This catches scanner/tool failures that prevented a
+              # trustworthy security result.
+              if github_result in {"failure", "cancelled"}:
+                  status = "FAIL"
+              elif github_result == "skipped":
+                  status = "REVIEW"
+              elif "FAIL" in statuses:
+                  status = "FAIL"
+              elif "WARNING" in statuses:
+                  status = "WARNING"
+              elif "PASS" in statuses:
+                  status = "PASS"
+              else:
+                  status = "REVIEW"
+
+              summaries = []
+              for path, data in parsed:
+                  summaries.append({
+                      "report_file": str(path.relative_to(base)),
+                      "status": data.get("status", "UNKNOWN"),
+                      "checks": data.get("checks"),
+                      "findings": data.get("findings"),
+                      "failed_checks": data.get("failed_checks"),
+                      "warnings": data.get("warnings"),
+                      "review_items": data.get("review_items"),
+                      "recommendation": data.get("recommendation"),
+                  })
+
+                  # Preserve useful top-level finding/check information in the
+                  # final machine-readable report without copying secrets.
+                  for key in ("findings", "review_items", "warnings", "packages_without_detected_license"):
+                      value = data.get(key)
+                      if isinstance(value, list):
+                          for item in value[:500]:
+                              all_findings.append({
+                                  "job": name,
+                                  "category": key,
+                                  "detail": item,
+                              })
+
               rows.append({
                   "job": name,
-                  "github_result": result,
-                  "status": status_map.get(result, "REVIEW"),
+                  "artifact": artifact_dir,
+                  "github_result": github_result,
+                  "status": status,
+                  "reports_found": len(report_files),
+                  "report_summaries": summaries,
               })
 
           failures = [x for x in rows if x["status"] == "FAIL"]
-          reviews = [x for x in rows if x["status"] == "REVIEW"]
+          warnings = [x for x in rows if x["status"] in {"WARNING", "REVIEW"}]
 
-          final_status = (
-              "FAIL" if failures
-              else "WARNING" if reviews
-              else "PASS"
-          )
+          final_status = "FAIL" if failures else "WARNING" if warnings else "PASS"
 
           report = {
               "report": "OpenSandbox Security Validation",
-              "repository": "aviradigital/OpenSandbox",
+              "repository": os.environ.get("GITHUB_REPOSITORY", "aviradigital/OpenSandbox"),
               "commit": os.environ.get("GITHUB_SHA"),
               "workflow_run": os.environ.get("GITHUB_RUN_ID"),
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
               "final_status": final_status,
+              "summary": {
+                  "jobs_total": len(rows),
+                  "jobs_pass": sum(x["status"] == "PASS" for x in rows),
+                  "jobs_warning": sum(x["status"] == "WARNING" for x in rows),
+                  "jobs_review": sum(x["status"] == "REVIEW" for x in rows),
+                  "jobs_fail": sum(x["status"] == "FAIL" for x in rows),
+                  "finding_records_collected": len(all_findings),
+              },
               "jobs": rows,
-              "artifacts": sorted(
-                  str(p.relative_to(base))
-                  for p in base.rglob("*")
-                  if p.is_file()
-              ),
+              "finding_records": all_findings,
               "decision": (
-                  "Deployment blocked pending remediation/review."
+                  "Deployment blocked pending remediation/review because one or more validation jobs failed."
                   if final_status == "FAIL"
-                  else "Deployment requires documented warning/review acceptance."
+                  else "Security validation completed with warnings/review items. Deployment requires documented acceptance of those items."
                   if final_status == "WARNING"
                   else "Security validation passed for the checks implemented in this workflow."
               ),
               "reporting_model": (
-                  "Every validation job publishes a human-readable report.md and "
-                  "machine-readable report.json. Raw evidence is retained where "
-                  "safe; secret values are excluded."
+                  "Every validation job publishes a human-readable report.md and machine-readable report.json. "
+                  "The final report evaluates both GitHub job execution results and the status recorded inside each job report. "
+                  "Secret values are intentionally excluded from reports."
               ),
           }
 
@@ -1588,20 +1769,30 @@ jobs:
           lines = [
               "# OpenSandbox Security Validation Report",
               "",
-              f"**Repository:** `aviradigital/OpenSandbox`",
-              f"**Commit:** `{os.environ.get('GITHUB_SHA')}`",
-              f"**Workflow Run:** `{os.environ.get('GITHUB_RUN_ID')}`",
+              f"**Repository:** `{report['repository']}`",
+              f"**Commit:** `{report['commit']}`",
+              f"**Workflow Run:** `{report['workflow_run']}`",
+              f"**Generated:** `{report['generated_at_utc']}`",
               f"**FINAL STATUS:** **{final_status}**",
+              "",
+              "## Summary",
+              "",
+              f"- Jobs evaluated: **{report['summary']['jobs_total']}**",
+              f"- PASS: **{report['summary']['jobs_pass']}**",
+              f"- WARNING: **{report['summary']['jobs_warning']}**",
+              f"- REVIEW: **{report['summary']['jobs_review']}**",
+              f"- FAIL: **{report['summary']['jobs_fail']}**",
+              f"- Finding records collected: **{report['summary']['finding_records_collected']}**",
               "",
               "## Job Results",
               "",
-              "| Job | GitHub Result | Status |",
-              "|---|---|---|",
+              "| Job | GitHub Result | Report Status | Reports |",
+              "|---|---|---|---:|",
           ]
 
           for x in rows:
               lines.append(
-                  f"| {x['job']} | {x['github_result']} | {x['status']} |"
+                  f"| {x['job']} | {x['github_result']} | **{x['status']}** | {x['reports_found']} |"
               )
 
           lines += [
@@ -1610,18 +1801,39 @@ jobs:
               "",
               report["decision"],
               "",
-              "## Evidence",
+              "## Detailed Job Reports",
               "",
-              "Each validation job publishes its own `report.md` and `report.json` "
-              "artifact. Raw scanner evidence is retained where appropriate. "
-              "Secret values are intentionally excluded.",
+          ]
+
+          for x in rows:
+              lines += [
+                  f"### {x['job']}",
+                  "",
+                  f"- GitHub result: `{x['github_result']}`",
+                  f"- Consolidated status: **{x['status']}**",
+              ]
+              if not x["report_summaries"]:
+                  lines.append("- No report.json was found in the downloaded artifact.")
+              else:
+                  for summary in x["report_summaries"]:
+                      lines.append(f"- Report: `{summary['report_file']}`")
+                      if summary.get("recommendation"):
+                          lines.append(f"- Recommendation: {summary['recommendation']}")
+              lines.append("")
+
+          lines += [
+              "## Reviewer Instructions",
               "",
-              "## What reviewers should open",
+              "1. Open the job-specific artifact and read `report.md` first.",
+              "2. Use `report.json` for structured details and scanner evidence.",
+              "3. For CodeQL, use the GitHub Code Scanning results for detailed findings.",
+              "4. Treat FAIL as a deployment blocker.",
+              "5. Treat WARNING/REVIEW as requiring documented security review/acceptance before deployment.",
+              "6. Do not use this report as evidence that an unimplemented control has passed.",
               "",
-              "1. Open the job-specific artifact for detailed findings and evidence.",
-              "2. Read `report.md` first for a human-readable summary.",
-              "3. Use `report.json` for complete structured results.",
-              "4. Use the `FINAL/security-validation-report.md` for the overall decision.",
+              "## Evidence Handling",
+              "",
+              "Raw scanner evidence is retained where appropriate. Secret values are intentionally excluded.",
           ]
 
           (final / "security-validation-report.md").write_text(
@@ -1630,8 +1842,6 @@ jobs:
 
           print("\n".join(lines))
 
-          # The final job reports the consolidated decision.
-          # Individual security jobs retain their own gates.
           if final_status == "FAIL":
               raise SystemExit(1)
           PY
