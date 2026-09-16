@@ -1221,26 +1221,30 @@ jobs:
           rm -f trivy-image-raw.json
 
       # --------------------------------------------------
-      # Classify image vulnerabilities
+      # Classify image vulnerabilities + security gate
       #
-      # HIGH findings with a known fixed version are actionable.
-      # HIGH findings without a fixed version are reported as
-      # NO_FIX_AVAILABLE and do not fail this validation gate.
+      # Keep classification and gating in the same step as the
+      # Trivy report generation so there is no cross-step file
+      # dependency.
       # --------------------------------------------------
-      - name: Classify image vulnerabilities
-        if: always()
+      - name: Classify image vulnerabilities and enforce gate
         run: |
           set -e
-          mkdir -p docker-image-security
 
-          if [ ! -f docker-image-security/docker-image-security-report.json ]; then
-            echo "Image vulnerability report not found."
-            exit 0
+          REPORT="docker-image-security/docker-image-security-report.json"
+
+          if [ ! -f "$REPORT" ]; then
+            echo "ERROR: Trivy image report was not generated."
+            echo "Expected: $REPORT"
+            echo ""
+            echo "Contents of workspace:"
+            find docker-image-security -maxdepth 2 -type f -print 2>/dev/null || true
+            exit 1
           fi
 
           python3 <<'PY'
           import json
-          from collections import Counter
+          import sys
 
           report_file = "docker-image-security/docker-image-security-report.json"
 
@@ -1249,9 +1253,9 @@ jobs:
 
           findings = report.get("findings", [])
 
+          critical = []
           actionable = []
           no_fix = []
-          critical = []
 
           for finding in findings:
               severity = (finding.get("severity") or "").upper()
@@ -1277,8 +1281,13 @@ jobs:
               "critical_findings": critical,
           }
 
+          classification_file = (
+              "docker-image-security/"
+              "vulnerability-classification.json"
+          )
+
           with open(
-              "docker-image-security/vulnerability-classification.json",
+              classification_file,
               "w",
               encoding="utf-8",
           ) as f:
@@ -1289,15 +1298,16 @@ jobs:
           print("Vulnerability Classification")
           print("========================================")
           print(f"Total HIGH/CRITICAL      : {len(findings)}")
-          print(f"CRITICAL                : {len(critical)}")
-          print(f"Known fixed version     : {len(actionable)}")
-          print(f"No fixed version        : {len(no_fix)}")
-          print("----------------------------------------")
+          print(f"CRITICAL                 : {len(critical)}")
+          print(f"Known fixed version      : {len(actionable)}")
+          print(f"No fixed version         : {len(no_fix)}")
+          print("")
 
           for item in actionable:
               print(
                   "ACTIONABLE | "
                   f"{item.get('vulnerability_id')} | "
+                  f"{item.get('severity')} | "
                   f"{item.get('package')} | "
                   f"{item.get('installed_version')} -> "
                   f"{item.get('fixed_version')}"
@@ -1307,63 +1317,21 @@ jobs:
               print(
                   "NO_FIX_AVAILABLE | "
                   f"{item.get('vulnerability_id')} | "
+                  f"{item.get('severity')} | "
                   f"{item.get('package')} | "
                   f"{item.get('installed_version')}"
               )
-          PY
-
-      # --------------------------------------------------
-      # Security gate
-      #
-      # Block only CRITICAL findings or HIGH findings for which
-      # Trivy provides a known fixed version.
-      #
-      # OS findings with no fixed version remain documented and
-      # require security review/acceptance rather than a fake fix.
-      # --------------------------------------------------
-      - name: Security validation gate
-        if: always()
-        run: |
-          set -e
-
-          REPORT="docker-image-security/vulnerability-classification.json"
-
-          if [ ! -f "$REPORT" ]; then
-            echo "Security classification report not found."
-            exit 1
-          fi
-
-          python3 <<'PY'
-          import json
-          import sys
-
-          with open(
-              "docker-image-security/vulnerability-classification.json",
-              "r",
-              encoding="utf-8",
-          ) as f:
-              data = json.load(f)
-
-          summary = data.get("summary", {})
-
-          critical = summary.get("critical", 0)
-          actionable = summary.get("actionable_with_fixed_version", 0)
-          no_fix = summary.get("no_fix_available", 0)
 
           print("")
           print("========================================")
           print("Security Validation Gate")
           print("========================================")
-          print(f"CRITICAL findings       : {critical}")
-          print(f"Actionable HIGH/CRITICAL: {actionable}")
-          print(f"No-fix findings        : {no_fix}")
-          print("")
 
-          if critical > 0:
+          if critical:
               print("FAIL: CRITICAL vulnerabilities detected.")
               sys.exit(1)
 
-          if actionable > 0:
+          if actionable:
               print(
                   "FAIL: HIGH/CRITICAL vulnerabilities with a known "
                   "fixed version remain."
@@ -1381,6 +1349,12 @@ jobs:
                   "and require documented security review/acceptance."
               )
           PY
+
+          echo ""
+          echo "Classification report:"
+          ls -lh "$REPORT" \
+            docker-image-security/vulnerability-classification.json
+          echo ""
 
       # --------------------------------------------------
       # Generate image SBOM
