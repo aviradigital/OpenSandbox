@@ -1117,9 +1117,33 @@ jobs:
           echo "=============================================="
 
       # --------------------------------------------------
+      # Install Trivy in THIS job. Each GitHub Actions job runs
+      # on a separate runner, so Trivy from another job is not
+      # available here.
+      # --------------------------------------------------
+      - name: Install Trivy for Docker image scan
+        run: |
+          set -euo pipefail
+
+          TRIVY_VERSION="0.74.0"
+          TRIVY_BIN="$HOME/.local/bin"
+
+          mkdir -p "$TRIVY_BIN"
+
+          curl -sfL \
+            "https://raw.githubusercontent.com/aquasecurity/trivy/v${TRIVY_VERSION}/install.sh" \
+            | sh -s -- -b "$TRIVY_BIN" "v${TRIVY_VERSION}"
+
+          echo "$TRIVY_BIN" >> "$GITHUB_PATH"
+          export PATH="$TRIVY_BIN:$PATH"
+
+          echo "Trivy version:"
+          trivy --version
+
+      # --------------------------------------------------
       - name: Scan, classify and gate Docker image
         run: |
-          set -e
+          set -euo pipefail
 
           IMAGE="opensandbox-server:security-validation"
           WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -1334,26 +1358,3 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      # --------------------------------------------------
-      # Install Trivy
-      # --------------------------------------------------
-      - name: Install Trivy
-        run: |
-          set -e
-
-          TRIVY_VERSION="0.74.0"
-
-          wget -q \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-
-          tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-
-          sudo mv trivy /usr/local/bin/trivy
-
-          trivy --version
-
-      # --------------------------------------------------
-      # Scan Docker image
-      # --------------------------------------------------
-      # Upload Docker image security report
-      # --------------------------------------------------
