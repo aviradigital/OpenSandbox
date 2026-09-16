@@ -825,8 +825,11 @@ jobs:
       # The OpenSandbox image has an ENTRYPOINT of
       # opensandbox-server.
       #
-      # Therefore we must override the ENTRYPOINT when
-      # executing Python commands inside the image.
+      # Therefore we override the ENTRYPOINT when executing
+      # Python commands inside the image.
+      #
+      # This diagnostic is report-only. It does NOT modify
+      # the image, repository, or dependency lock files.
       # --------------------------------------------------
       - name: Inspect Python packages in image
         if: always()
@@ -840,14 +843,14 @@ jobs:
           echo "=============================================="
 
           echo ""
-          echo "Python version:"
+          echo "Application virtual environment:"
           docker run --rm \
             --entrypoint /app/.venv/bin/python \
             "$IMAGE" \
             --version
 
           echo ""
-          echo "Checking jaraco.context..."
+          echo "Checking jaraco.context in application venv..."
           docker run --rm \
             --entrypoint /app/.venv/bin/python \
             "$IMAGE" \
@@ -858,27 +861,23 @@ jobs:
 
           try:
               dist = metadata.distribution(package)
-
               print("FOUND")
               print("Name:", dist.metadata.get("Name"))
               print("Version:", dist.version)
               print("Location:", dist.locate_file(""))
               print("Requires-Dist:")
-
               requirements = dist.requires or []
-
               if requirements:
                   for req in requirements:
                       print("  ", req)
               else:
                   print("   None")
-
           except metadata.PackageNotFoundError:
               print("NOT FOUND")
           '
 
           echo ""
-          echo "Checking wheel..."
+          echo "Checking wheel in application venv..."
           docker run --rm \
             --entrypoint /app/.venv/bin/python \
             "$IMAGE" \
@@ -889,42 +888,104 @@ jobs:
 
           try:
               dist = metadata.distribution(package)
-
               print("FOUND")
               print("Name:", dist.metadata.get("Name"))
               print("Version:", dist.version)
               print("Location:", dist.locate_file(""))
               print("Requires-Dist:")
-
               requirements = dist.requires or []
-
               if requirements:
                   for req in requirements:
                       print("  ", req)
               else:
                   print("   None")
-
           except metadata.PackageNotFoundError:
               print("NOT FOUND")
           '
 
           echo ""
-          echo "Installed Python distributions:"
+          echo "Checking system Python:"
           docker run --rm \
-            --entrypoint /app/.venv/bin/python \
+            --entrypoint /usr/local/bin/python \
+            "$IMAGE" \
+            --version
+
+          echo ""
+          echo "Checking jaraco.context in system Python..."
+          docker run --rm \
+            --entrypoint /usr/local/bin/python \
             "$IMAGE" \
             -c '
           import importlib.metadata as metadata
 
-          packages = sorted(
-              metadata.distributions(),
-              key=lambda d: (d.metadata.get("Name") or "").lower()
-          )
+          package = "jaraco.context"
 
-          for dist in packages:
-              name = dist.metadata.get("Name") or "UNKNOWN"
-              version = dist.version or "UNKNOWN"
-              print(f"{name}=={version}")
+          try:
+              dist = metadata.distribution(package)
+              print("FOUND")
+              print("Name:", dist.metadata.get("Name"))
+              print("Version:", dist.version)
+              print("Location:", dist.locate_file(""))
+              print("Requires-Dist:")
+              requirements = dist.requires or []
+              if requirements:
+                  for req in requirements:
+                      print("  ", req)
+              else:
+                  print("   None")
+          except metadata.PackageNotFoundError:
+              print("NOT FOUND")
+          '
+
+          echo ""
+          echo "Checking wheel in system Python..."
+          docker run --rm \
+            --entrypoint /usr/local/bin/python \
+            "$IMAGE" \
+            -c '
+          import importlib.metadata as metadata
+
+          package = "wheel"
+
+          try:
+              dist = metadata.distribution(package)
+              print("FOUND")
+              print("Name:", dist.metadata.get("Name"))
+              print("Version:", dist.version)
+              print("Location:", dist.locate_file(""))
+              print("Requires-Dist:")
+              requirements = dist.requires or []
+              if requirements:
+                  for req in requirements:
+                      print("  ", req)
+              else:
+                  print("   None")
+          except metadata.PackageNotFoundError:
+              print("NOT FOUND")
+          '
+
+          echo ""
+          echo "Searching entire image filesystem for package metadata..."
+          docker run --rm \
+            --entrypoint /bin/sh \
+            "$IMAGE" \
+            -c '
+          echo "--- jaraco.context metadata ---"
+          find / -type d \( \
+            -iname "jaraco.context-*.dist-info" -o \
+            -iname "jaraco_context-*.dist-info" \
+          \) 2>/dev/null || true
+
+          echo "--- wheel metadata ---"
+          find / -type d \
+            -iname "wheel-*.dist-info" \
+            2>/dev/null || true
+
+          echo "--- Python package locations ---"
+          find /usr /opt /app -type d \( \
+            -iname "site-packages" -o \
+            -iname "dist-packages" \
+          \) 2>/dev/null || true
           '
 
           echo ""
