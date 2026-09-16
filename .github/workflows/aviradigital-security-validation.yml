@@ -1393,9 +1393,13 @@ jobs:
           # Use the Docker runtime configuration for the Docker image.
           # The health probe runs from inside the container so the check does
           # not depend on the application binding to the host interface.
+          # OpenSandbox's Docker runtime requires access to the Docker Engine.
+          # This container exists only on the ephemeral GitHub-hosted runner.
           docker run -d \
             --name opensandbox-security-test \
             -e OPENSANDBOX_INSECURE_SERVER=YES \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -p 18090:8080 \
             "$IMAGE-build-test" \
             > security-reports/build-test/container-id.txt 2>&1
 
@@ -1429,20 +1433,44 @@ jobs:
 
           HTTP_CODE="000"
           RESPONSE_FILE="security-reports/build-test/health-response.txt"
+          : > security-reports/build-test/health-error.txt
 
-          for attempt in $(seq 1 15); do
-            docker exec opensandbox-security-test \
-              python -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=5).getcode())' \
-              > "$RESPONSE_FILE" 2> security-reports/build-test/health-error.txt
-
-            rc=$?
-            if [ "$rc" -eq 0 ]; then
-              HTTP_CODE=$(tr -d '[:space:]' < "$RESPONSE_FILE")
+          # Probe both paths: from inside the container and through the
+          # published host port. This makes binding/startup failures explicit.
+          for attempt in $(seq 1 30); do
+            if ! docker inspect -f '{{.State.Running}}' opensandbox-security-test 2>/dev/null | grep -q '^true$'; then
+              echo "Container is no longer running at health attempt $attempt" \
+                | tee -a security-reports/build-test/health-error.txt
               break
             fi
 
+            docker exec opensandbox-security-test \
+              python -c 'import urllib.request; r=urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=3); print(r.status); print(r.read().decode("utf-8", "replace"))' \
+              > "$RESPONSE_FILE" 2>> security-reports/build-test/health-error.txt
+
+            exec_rc=$?
+            if [ "$exec_rc" -eq 0 ]; then
+              HTTP_CODE=$(head -n1 "$RESPONSE_FILE" | tr -d '[:space:]')
+              if [ "$HTTP_CODE" = "200" ]; then
+                echo "Container-internal health check returned HTTP 200."
+                break
+              fi
+            fi
+
+            echo "Health attempt $attempt: internal rc=$exec_rc HTTP=$HTTP_CODE" \
+              | tee -a security-reports/build-test/health-attempts.txt
+
             sleep 2
           done
+
+          # Also test the published host port when the container is still up.
+          if docker inspect -f '{{.State.Running}}' opensandbox-security-test 2>/dev/null | grep -q '^true$'; then
+            curl -sS --connect-timeout 3 --max-time 5 \
+              -o security-reports/build-test/host-health-response.txt \
+              -w '%{http_code}' \
+              http://127.0.0.1:18090/health \
+              > security-reports/build-test/host-health-status.txt 2> security-reports/build-test/host-health-error.txt || true
+          fi
 
           echo "HTTP status: $HTTP_CODE" \
             | tee security-reports/build-test/health-status.txt
