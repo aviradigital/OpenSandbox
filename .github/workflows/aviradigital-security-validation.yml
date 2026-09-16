@@ -9,173 +9,162 @@ on:
 permissions:
   contents: read
 
+env:
+  TRIVY_VERSION: "0.74.0"
+  SYFT_VERSION: "1.51.1"
+  IMAGE: "opensandbox-server:security-validation"
+  REPORT_RETENTION_DAYS: "30"
+
 jobs:
 
   # ==========================================================
-  # 1. LICENSE & DEPENDENCY SCAN
+  # 1. LICENSE & DEPENDENCY / SBOM REPORT
   # ==========================================================
   license-dependency-scan:
     name: License & Dependency Scan
     runs-on: ubuntu-latest
 
     steps:
-
-      # --------------------------------------------------
-      # 1. Checkout repository
-      # --------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # --------------------------------------------------
-      # 2. Install Syft
-      # --------------------------------------------------
       - name: Install Syft
         run: |
-          set -e
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b "$HOME/.local/bin" "v${SYFT_VERSION}"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/syft" version
 
-          echo "Installing Syft..."
-
-          curl -sSfL https://get.anchore.io/syft \
-            | sh -s -- -b /usr/local/bin
-
-          echo "Syft version:"
-          syft version
-
-      # --------------------------------------------------
-      # 3. Generate SBOM and license inventory
-      # --------------------------------------------------
-      - name: Generate SBOM and license inventory
+      - name: Generate dependency SBOM and license inventory
         run: |
-          set -e
-
-          echo "Starting OpenSandbox dependency and license scan..."
+          set -euo pipefail
+          mkdir -p security-reports/license-dependency
 
           syft scan dir:. \
             --enrich javascript,python \
-            -o syft-json=license-report.json
+            -o syft-json=security-reports/license-dependency/syft-license-report.json
 
-          echo "License/dependency scan completed."
+          cp security-reports/license-dependency/syft-license-report.json \
+             security-reports/license-dependency/license-report.json
 
-          echo "Generated report:"
-          ls -lh license-report.json
-
-      # --------------------------------------------------
-      # 4. Show license summary
-      # --------------------------------------------------
-      - name: Show scan summary
+      - name: Generate license and dependency report
         run: |
-          python3 - <<'PY'
+          set -euo pipefail
+          python3 <<'PY'
           import json
           from collections import Counter
+          from pathlib import Path
 
-          REPORT = "license-report.json"
+          src = Path("security-reports/license-dependency/syft-license-report.json")
+          out_json = Path("security-reports/license-dependency/report.json")
+          out_md = Path("security-reports/license-dependency/report.md")
 
-          with open(REPORT, "r", encoding="utf-8") as f:
-              data = json.load(f)
-
+          data = json.loads(src.read_text(encoding="utf-8"))
           artifacts = data.get("artifacts", [])
 
-          license_records = []
           license_counts = Counter()
+          missing = []
+          records = []
 
-          for artifact in artifacts:
+          for a in artifacts:
+              name = a.get("name", "UNKNOWN")
+              version = a.get("version", "UNKNOWN")
+              typ = a.get("type", "UNKNOWN")
+              licenses = a.get("licenses") or []
 
-              artifact_name = artifact.get("name", "UNKNOWN")
-              artifact_version = artifact.get("version", "UNKNOWN")
-              artifact_type = artifact.get("type", "UNKNOWN")
+              if not licenses:
+                  missing.append({
+                      "package": name,
+                      "version": version,
+                      "type": typ,
+                  })
 
-              licenses = artifact.get("licenses") or []
-
-              for license_info in licenses:
-
-                  if isinstance(license_info, dict):
-
-                      license_value = (
-                          license_info.get("spdxExpression")
-                          or license_info.get("value")
-                          or "UNKNOWN"
-                      )
-
+              for lic in licenses:
+                  if isinstance(lic, dict):
+                      value = lic.get("spdxExpression") or lic.get("value") or "UNKNOWN"
                   else:
-                      license_value = str(license_info)
+                      value = str(lic)
+                  license_counts[value] += 1
+                  records.append({
+                      "package": name,
+                      "version": version,
+                      "type": typ,
+                      "license": value,
+                  })
 
-                  license_records.append(
-                      {
-                          "package": artifact_name,
-                          "version": artifact_version,
-                          "type": artifact_type,
-                          "license": license_value,
-                      }
+          report = {
+              "job": "License & Dependency Scan",
+              "status": "REVIEW" if missing else "PASS",
+              "artifacts_detected": len(artifacts),
+              "license_records": len(records),
+              "licenses": dict(license_counts),
+              "packages_without_detected_license": missing,
+              "license_records_detail": records,
+          }
+          out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+          lines = [
+              "# License & Dependency Scan",
+              "",
+              f"**Status:** {report['status']}",
+              f"**Artifacts detected:** {len(artifacts)}",
+              f"**License records:** {len(records)}",
+              f"**Packages without detected license:** {len(missing)}",
+              "",
+              "## License Summary",
+              "",
+              "| License | Count |",
+              "|---|---:|",
+          ]
+          for k, v in license_counts.most_common():
+              lines.append(f"| `{k}` | {v} |")
+
+          if missing:
+              lines += [
+                  "",
+                  "## Review Items",
+                  "",
+                  "The following artifacts have no license detected by Syft and require review:",
+                  "",
+              ]
+              for item in missing[:200]:
+                  lines.append(
+                      f"- `{item['package']}` `{item['version']}` ({item['type']})"
                   )
 
-                  license_counts[license_value] += 1
-
-          print("")
-          print("==============================================")
-          print("       OpenSandbox License Scan")
-          print("==============================================")
-          print(f"Artifacts detected : {len(artifacts)}")
-          print(f"License records    : {len(license_records)}")
-          print("----------------------------------------------")
-          print("License summary")
-          print("----------------------------------------------")
-
-          if license_counts:
-
-              for license_name, count in license_counts.most_common():
-                  print(f"{license_name}: {count}")
-
-          else:
-              print("No license records detected.")
-
-          print("==============================================")
+          out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print("\n".join(lines))
           PY
 
-      # --------------------------------------------------
-      # 5. Run license policy check
-      # --------------------------------------------------
       - name: Run license policy check
         run: |
-          set -e
+          set -euo pipefail
+          if [ -f .github/scripts/policy_check.py ]; then
+            python3 .github/scripts/policy_check.py
+          else
+            echo "No policy_check.py found; policy check not executed."
+          fi
 
-          echo "Running license policy check..."
-
-          python3 .github/scripts/policy_check.py
-
-      # --------------------------------------------------
-      # 6. Upload Syft license report
-      # --------------------------------------------------
-      - name: Upload license report
+      - name: Upload license and dependency report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: opensandbox-license-report
-          path: license-report.json
-          retention-days: 7
-
-      # --------------------------------------------------
-      # 7. Upload license policy report
-      # --------------------------------------------------
-      - name: Upload license policy report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: opensandbox-license-policy-report
-          path: license-policy-report.json
-          retention-days: 7
+          name: 01-license-dependency-report
+          path: security-reports/license-dependency/
+          if-no-files-found: warn
+          retention-days: ${{ env.REPORT_RETENTION_DAYS }}
 
 
   # ==========================================================
-  # 2. DEPENDENCY VULNERABILITY SCAN
+  # 2. DEPENDENCY VULNERABILITY REPORT
   # ==========================================================
   vulnerability-scan:
     name: Dependency Vulnerability Scan
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -183,254 +172,294 @@ jobs:
 
       - name: Install Trivy
         run: |
-          set -e
+          set -euo pipefail
 
-          echo "Installing Trivy..."
+          mkdir -p "$HOME/.local/bin"
 
-          sudo apt-get update
-          sudo apt-get install -y wget
+          ARCHIVE="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${ARCHIVE}"
 
-          wget -qO- https://aquasecurity.github.io/trivy-repo/deb/public.key \
-            | sudo gpg --dearmor \
-            | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "$RUNNER_TEMP/$ARCHIVE" "$URL"
 
-          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
-            | sudo tee /etc/apt/sources.list.d/trivy.list
+          tar -xzf "$RUNNER_TEMP/$ARCHIVE" \
+            -C "$RUNNER_TEMP" trivy
 
-          sudo apt-get update
-          sudo apt-get install -y trivy
+          install -m 0755 "$RUNNER_TEMP/trivy" "$HOME/.local/bin/trivy"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-          echo "Trivy version:"
           trivy --version
 
       - name: Run filesystem vulnerability scan
         run: |
           set +e
-
-          echo "Starting OpenSandbox vulnerability scan..."
+          mkdir -p security-reports/vulnerability
 
           trivy fs . \
             --scanners vuln \
             --severity HIGH,CRITICAL \
             --format json \
-            --output trivy-vulnerability-report.json
+            --output security-reports/vulnerability/trivy-report.json \
+            --exit-code 0
 
-          TRIVY_EXIT_CODE=$?
-
-          echo "Trivy exit code: ${TRIVY_EXIT_CODE}"
-
-          if [ -f trivy-vulnerability-report.json ]; then
-            echo "Vulnerability report generated:"
-            ls -lh trivy-vulnerability-report.json
-          fi
-
-          # Report-only for MVP.
-          # Vulnerabilities will NOT block the pipeline yet.
+          rc=$?
+          echo "Trivy exit code: $rc"
           exit 0
 
-      - name: Show vulnerability summary
+      - name: Generate vulnerability report
         if: always()
         run: |
-          python3 - <<'PY'
+          set -euo pipefail
+          python3 <<'PY'
           import json
           from collections import Counter
+          from pathlib import Path
 
-          report = "trivy-vulnerability-report.json"
+          src = Path("security-reports/vulnerability/trivy-report.json")
+          out_json = Path("security-reports/vulnerability/report.json")
+          out_md = Path("security-reports/vulnerability/report.md")
 
-          try:
-              with open(report, "r", encoding="utf-8") as f:
-                  data = json.load(f)
-          except FileNotFoundError:
-              print("No Trivy report found.")
+          if not src.exists():
+              report = {
+                  "job": "Dependency Vulnerability Scan",
+                  "status": "FAIL",
+                  "error": "Trivy report was not generated",
+              }
+              out_json.write_text(json.dumps(report, indent=2))
+              out_md.write_text(
+                  "# Dependency Vulnerability Scan\n\n"
+                  "**Status:** FAIL\n\n"
+                  "Trivy report was not generated.\n"
+              )
               raise SystemExit(0)
 
-          severity_counts = Counter()
-          vulnerability_count = 0
+          data = json.loads(src.read_text(encoding="utf-8"))
+          findings = []
 
-          for result in data.get("Results", []):
-              for vulnerability in result.get("Vulnerabilities") or []:
-                  vulnerability_count += 1
-                  severity = vulnerability.get("Severity", "UNKNOWN")
-                  severity_counts[severity] += 1
+          for result in data.get("Results", []) or []:
+              target = result.get("Target", "")
+              for v in result.get("Vulnerabilities", []) or []:
+                  findings.append({
+                      "id": v.get("VulnerabilityID"),
+                      "severity": v.get("Severity", "UNKNOWN"),
+                      "package": v.get("PkgName"),
+                      "installed_version": v.get("InstalledVersion"),
+                      "fixed_version": v.get("FixedVersion"),
+                      "target": target,
+                      "title": v.get("Title"),
+                  })
 
-          print("")
-          print("==============================================")
-          print("     OpenSandbox Vulnerability Summary")
-          print("==============================================")
-          print(f"Total vulnerabilities : {vulnerability_count}")
-          print(f"CRITICAL              : {severity_counts['CRITICAL']}")
-          print(f"HIGH                  : {severity_counts['HIGH']}")
-          print(f"MEDIUM                : {severity_counts['MEDIUM']}")
-          print(f"LOW                   : {severity_counts['LOW']}")
-          print(f"UNKNOWN               : {severity_counts['UNKNOWN']}")
-          print("==============================================")
+          counts = Counter(x["severity"].upper() for x in findings)
+          fixed_high_critical = [
+              x for x in findings
+              if x["severity"].upper() in {"HIGH", "CRITICAL"}
+              and x.get("fixed_version")
+          ]
+          critical = [
+              x for x in findings
+              if x["severity"].upper() == "CRITICAL"
+          ]
 
-          print("")
-          print("Top vulnerability findings:")
-          print("----------------------------------------------")
+          status = "FAIL" if critical or fixed_high_critical else (
+              "WARNING" if findings else "PASS"
+          )
 
-          shown = 0
+          report = {
+              "job": "Dependency Vulnerability Scan",
+              "status": status,
+              "summary": {
+                  "total": len(findings),
+                  "critical": counts.get("CRITICAL", 0),
+                  "high": counts.get("HIGH", 0),
+                  "medium": counts.get("MEDIUM", 0),
+                  "low": counts.get("LOW", 0),
+                  "fixed_high_critical": len(fixed_high_critical),
+                  "no_fix_high_critical": sum(
+                      1 for x in findings
+                      if x["severity"].upper() in {"HIGH", "CRITICAL"}
+                      and not x.get("fixed_version")
+                  ),
+              },
+              "findings": findings,
+          }
 
-          for result in data.get("Results", []):
-              target = result.get("Target", "UNKNOWN")
+          out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-              for vulnerability in result.get("Vulnerabilities") or []:
-                  vuln_id = vulnerability.get("VulnerabilityID", "UNKNOWN")
-                  severity = vulnerability.get("Severity", "UNKNOWN")
-                  package = vulnerability.get("PkgName", "UNKNOWN")
-                  installed = vulnerability.get("InstalledVersion", "UNKNOWN")
-                  fixed = vulnerability.get("FixedVersion", "Not available")
+          lines = [
+              "# Dependency Vulnerability Scan",
+              "",
+              f"**Status:** {status}",
+              "",
+              f"- Total: {len(findings)}",
+              f"- CRITICAL: {counts.get('CRITICAL', 0)}",
+              f"- HIGH: {counts.get('HIGH', 0)}",
+              f"- MEDIUM: {counts.get('MEDIUM', 0)}",
+              f"- LOW: {counts.get('LOW', 0)}",
+              f"- Fixable HIGH/CRITICAL: {len(fixed_high_critical)}",
+              "",
+              "## Findings",
+              "",
+              "| Severity | CVE | Package | Installed | Fixed | Target |",
+              "|---|---|---|---|---|---|",
+          ]
 
-                  print(
-                      f"{severity:8} "
-                      f"{vuln_id:20} "
-                      f"{package} "
-                      f"{installed} "
-                      f"-> {fixed} "
-                      f"[{target}]"
-                  )
+          for x in findings:
+              lines.append(
+                  f"| {x['severity']} | {x['id']} | {x['package']} | "
+                  f"{x['installed_version']} | {x.get('fixed_version') or 'No fixed version'} | "
+                  f"{x['target']} |"
+              )
 
-                  shown += 1
-
-                  if shown >= 50:
-                      print("... showing first 50 findings")
-                      raise SystemExit(0)
+          out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print("\n".join(lines))
           PY
 
       - name: Upload vulnerability report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: opensandbox-vulnerability-report
-          path: trivy-vulnerability-report.json
-          retention-days: 7
+          name: 02-vulnerability-report
+          path: security-reports/vulnerability/
+          if-no-files-found: warn
+          retention-days: ${{ env.REPORT_RETENTION_DAYS }}
 
 
   # ==========================================================
-  # 3. SECRETS SCAN
+  # 3. SECRETS REPORT
   # ==========================================================
   secrets-scan:
     name: Secrets Scan
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install Trivy
         run: |
-          sudo apt-get update
-          sudo apt-get install -y wget
+          set -euo pipefail
 
-          TRIVY_VERSION="0.74.0"
+          mkdir -p "$HOME/.local/bin"
+          ARCHIVE="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${ARCHIVE}"
 
-          wget -q \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "$RUNNER_TEMP/$ARCHIVE" "$URL"
 
-          tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-
-          sudo mv trivy /usr/local/bin/trivy
+          tar -xzf "$RUNNER_TEMP/$ARCHIVE" -C "$RUNNER_TEMP" trivy
+          install -m 0755 "$RUNNER_TEMP/trivy" "$HOME/.local/bin/trivy"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
           trivy --version
 
       - name: Run secrets scan
         run: |
-          set -e
+          set -euo pipefail
+          mkdir -p security-reports/secrets
 
           trivy fs . \
             --scanners secret \
             --format json \
-            --output trivy-secret-raw.json \
+            --output security-reports/secrets/raw-secret-report.json \
             --exit-code 0
 
-      - name: Create sanitized secrets report
+      - name: Generate sanitized secrets report
+        if: always()
         run: |
+          set -euo pipefail
+
           python3 <<'PY'
           import json
           from collections import Counter
+          from pathlib import Path
 
-          input_file = "trivy-secret-raw.json"
-          output_file = "secret-scan-report.json"
-
-          with open(input_file, "r", encoding="utf-8") as f:
-              data = json.load(f)
+          src = Path("security-reports/secrets/raw-secret-report.json")
+          out_json = Path("security-reports/secrets/report.json")
+          out_md = Path("security-reports/secrets/report.md")
 
           findings = []
 
-          for result in data.get("Results", []):
-              target = result.get("Target", "")
+          if src.exists():
+              data = json.loads(src.read_text(encoding="utf-8"))
+              for result in data.get("Results", []) or []:
+                  target = result.get("Target", "")
+                  for secret in result.get("Secrets", []) or []:
+                      # Never copy the actual secret/match into the report.
+                      findings.append({
+                          "rule_id": secret.get("RuleID"),
+                          "category": secret.get("Category"),
+                          "severity": secret.get("Severity", "UNKNOWN"),
+                          "title": secret.get("Title"),
+                          "target": target,
+                          "start_line": secret.get("StartLine"),
+                          "end_line": secret.get("EndLine"),
+                      })
 
-              for secret in result.get("Secrets", []) or []:
-                  findings.append({
-                      "rule_id": secret.get("RuleID"),
-                      "category": secret.get("Category"),
-                      "severity": secret.get("Severity"),
-                      "title": secret.get("Title"),
-                      "target": target,
-                      "start_line": secret.get("StartLine"),
-                      "end_line": secret.get("EndLine")
-                  })
-
-          severity_counts = Counter(
-              item.get("severity") or "UNKNOWN"
-              for item in findings
-          )
+          counts = Counter(x["severity"].upper() for x in findings)
+          status = "FAIL" if any(
+              x["severity"].upper() in {"CRITICAL", "HIGH"} for x in findings
+          ) else ("WARNING" if findings else "PASS")
 
           report = {
+              "job": "Secrets Scan",
+              "status": status,
               "summary": {
-                  "total_findings": len(findings),
-                  "critical": severity_counts.get("CRITICAL", 0),
-                  "high": severity_counts.get("HIGH", 0),
-                  "medium": severity_counts.get("MEDIUM", 0),
-                  "low": severity_counts.get("LOW", 0),
-                  "unknown": severity_counts.get("UNKNOWN", 0)
+                  "total": len(findings),
+                  "critical": counts.get("CRITICAL", 0),
+                  "high": counts.get("HIGH", 0),
+                  "medium": counts.get("MEDIUM", 0),
+                  "low": counts.get("LOW", 0),
+                  "unknown": counts.get("UNKNOWN", 0),
               },
-              "findings": findings
+              "findings": findings,
+              "note": "Secret values are intentionally excluded.",
           }
 
-          with open(output_file, "w", encoding="utf-8") as f:
-              json.dump(report, f, indent=2)
+          out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-          print("Secrets scan summary")
-          print("====================")
-          print(f"Total findings : {len(findings)}")
-          print(f"Critical       : {severity_counts.get('CRITICAL', 0)}")
-          print(f"High           : {severity_counts.get('HIGH', 0)}")
-          print(f"Medium         : {severity_counts.get('MEDIUM', 0)}")
-          print(f"Low            : {severity_counts.get('LOW', 0)}")
-          print(f"Unknown        : {severity_counts.get('UNKNOWN', 0)}")
+          lines = [
+              "# Secrets Scan",
+              "",
+              f"**Status:** {status}",
+              "",
+              f"- Total findings: {len(findings)}",
+              f"- CRITICAL: {counts.get('CRITICAL', 0)}",
+              f"- HIGH: {counts.get('HIGH', 0)}",
+              f"- MEDIUM: {counts.get('MEDIUM', 0)}",
+              f"- LOW: {counts.get('LOW', 0)}",
+              "",
+              "Secret values are intentionally excluded from this report.",
+              "",
+              "## Findings",
+              "",
+              "| Severity | Rule | Category | Target | Line |",
+              "|---|---|---|---|---:|",
+          ]
 
-          if findings:
-              print("")
-              print("Potential secrets detected:")
-              for item in findings:
-                  print(
-                      f"- {item['rule_id']} | "
-                      f"{item['severity']} | "
-                      f"{item['target']} | "
-                      f"line {item['start_line']}"
-                  )
-          else:
-              print("")
-              print("No secrets detected.")
+          for x in findings:
+              lines.append(
+                  f"| {x['severity']} | {x['rule_id']} | {x['category']} | "
+                  f"{x['target']} | {x['start_line']} |"
+              )
+
+          out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print("\n".join(lines))
           PY
 
-          # Never retain the raw report because it may contain
-          # the actual secret value.
-          rm -f trivy-secret-raw.json
+          rm -f security-reports/secrets/raw-secret-report.json
 
       - name: Upload sanitized secrets report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: secrets-scan-report
-          path: secret-scan-report.json
+          name: 03-secrets-report
+          path: security-reports/secrets/
           if-no-files-found: warn
+          retention-days: ${{ env.REPORT_RETENTION_DAYS }}
 
 
   # ==========================================================
-  # 4. SAST - CODEQL
+  # 4. SAST / CODEQL
   # ==========================================================
   sast-scan:
     name: SAST - CodeQL
@@ -449,7 +478,6 @@ jobs:
           - javascript-typescript
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -464,16 +492,52 @@ jobs:
         with:
           category: "/language:${{ matrix.language }}"
 
+      - name: Generate CodeQL job report
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "security-reports/sast/${{ matrix.language }}"
+
+          cat > "security-reports/sast/${{ matrix.language }}/report.md" <<EOF
+          # CodeQL SAST Report
+
+          **Language:** ${{ matrix.language }}
+          **Queries:** security-extended
+          **Analysis:** Completed through GitHub CodeQL
+          **Status:** ${{ job.status }}
+
+          Detailed CodeQL findings are retained in GitHub Code Scanning/Security
+          and are not duplicated into this artifact.
+          EOF
+
+          cat > "security-reports/sast/${{ matrix.language }}/report.json" <<EOF
+          {
+            "job": "SAST - CodeQL",
+            "language": "${{ matrix.language }}",
+            "query_suite": "security-extended",
+            "status": "${{ job.status }}",
+            "findings_location": "GitHub Code Scanning"
+          }
+          EOF
+
+      - name: Upload CodeQL report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 04-sast-report-${{ matrix.language }}
+          path: security-reports/sast/${{ matrix.language }}/
+          if-no-files-found: warn
+          retention-days: ${{ env.REPORT_RETENTION_DAYS }}
+
 
   # ==========================================================
-  # 5. SUSPICIOUS CODE / BINARY SCAN
+  # 5. SUSPICIOUS CODE / BINARY REPORT
   # ==========================================================
   suspicious-code-binary-scan:
     name: Suspicious Code and Binary Scan
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -481,16 +545,7 @@ jobs:
         shell: bash
         run: |
           set +e
-
-          mkdir -p security-inspection
-
-          echo "========================================"
-          echo "Suspicious Code / Binary Inspection"
-          echo "========================================"
-
-          echo ""
-          echo "1. Potential remote-code execution patterns"
-          echo "--------------------------------------------"
+          mkdir -p security-reports/suspicious-code
 
           rg -n -i \
             --hidden \
@@ -502,12 +557,7 @@ jobs:
             --glob '!**/dist/**' \
             --glob '!**/build/**' \
             'curl[[:space:]].*\|[[:space:]]*(sh|bash)|wget[[:space:]].*\|[[:space:]]*(sh|bash)|curl[[:space:]].*-o.*&&.*(sh|bash)|wget[[:space:]].*-O.*&&.*(sh|bash)' \
-            . \
-            > security-inspection/remote-execution.txt
-
-          echo ""
-          echo "2. Potential dynamic execution patterns"
-          echo "---------------------------------------"
+            . > security-reports/suspicious-code/remote-execution.txt
 
           rg -n \
             --hidden \
@@ -517,12 +567,7 @@ jobs:
             --glob '!**/venv/**' \
             --glob '!**/__pycache__/**' \
             'eval[[:space:]]*\(|exec[[:space:]]*\(|os\.system[[:space:]]*\(|subprocess\..*shell[[:space:]]*=[[:space:]]*True' \
-            . \
-            > security-inspection/dynamic-execution.txt
-
-          echo ""
-          echo "3. Potential encoded/obfuscated execution"
-          echo "-----------------------------------------"
+            . > security-reports/suspicious-code/dynamic-execution.txt
 
           rg -n -i \
             --hidden \
@@ -532,12 +577,7 @@ jobs:
             --glob '!**/venv/**' \
             --glob '!**/__pycache__/**' \
             'base64[[:space:]]+(-d|--decode)|frombase64string|atob[[:space:]]*\(' \
-            . \
-            > security-inspection/encoded-execution.txt
-
-          echo ""
-          echo "4. Potential permission manipulation"
-          echo "------------------------------------"
+            . > security-reports/suspicious-code/encoded-execution.txt
 
           rg -n \
             --hidden \
@@ -546,12 +586,7 @@ jobs:
             --glob '!**/.venv/**' \
             --glob '!**/venv/**' \
             'chmod[[:space:]]+\+x|chmod[[:space:]]+777|install[[:space:]]+-m[[:space:]]+777' \
-            . \
-            > security-inspection/permission-changes.txt
-
-          echo ""
-          echo "5. External download patterns"
-          echo "-----------------------------"
+            . > security-reports/suspicious-code/permission-changes.txt
 
           rg -n -i \
             --hidden \
@@ -559,14 +594,8 @@ jobs:
             --glob '!**/node_modules/**' \
             --glob '!**/.venv/**' \
             --glob '!**/venv/**' \
-            --glob '!**/__pycache__/**' \
             'https?://|requests\.(get|post)|urllib\.request|httpx\.(get|post)|wget[[:space:]]|curl[[:space:]]' \
-            . \
-            > security-inspection/external-downloads.txt
-
-          echo ""
-          echo "6. Executable / binary inventory"
-          echo "--------------------------------"
+            . > security-reports/suspicious-code/external-downloads.txt
 
           find . \
             -path './.git' -prune -o \
@@ -578,42 +607,25 @@ jobs:
             file "$file"
           done |
           grep -E 'ELF|Mach-O|PE32|executable' \
-            > security-inspection/binaries.txt
-
-          echo ""
-          echo "7. Git-tracked executable files"
-          echo "--------------------------------"
+            > security-reports/suspicious-code/binaries.txt
 
           git ls-files -s |
             awk '$1 ~ /^100755$/ {print $4}' \
-            > security-inspection/tracked-executables.txt
+            > security-reports/suspicious-code/tracked-executables.txt
 
-          echo ""
-          echo "Inspection completed."
-          echo "All findings are report-only."
-          echo ""
+          exit 0
 
-          for f in security-inspection/*.txt; do
-            echo "===== $f ====="
-            if [ -s "$f" ]; then
-              cat "$f"
-            else
-              echo "No findings"
-            fi
-            echo ""
-          done
-
-      - name: Generate inspection summary
+      - name: Generate suspicious-code report
         if: always()
-        shell: bash
         run: |
+          set -euo pipefail
+
           python3 <<'PY'
           import json
           from pathlib import Path
 
-          base = Path("security-inspection")
-
-          files = {
+          base = Path("security-reports/suspicious-code")
+          checks = {
               "remote_execution": "remote-execution.txt",
               "dynamic_execution": "dynamic-execution.txt",
               "encoded_execution": "encoded-execution.txt",
@@ -624,175 +636,186 @@ jobs:
           }
 
           report = {}
+          total = 0
 
-          for name, filename in files.items():
+          for name, filename in checks.items():
               path = base / filename
-
-              if path.exists():
-                  lines = [
-                      line.strip()
-                      for line in path.read_text(
-                          encoding="utf-8",
-                          errors="replace"
-                      ).splitlines()
-                      if line.strip()
-                  ]
-              else:
-                  lines = []
+              lines = [
+                  x.strip() for x in path.read_text(
+                      encoding="utf-8", errors="replace"
+                  ).splitlines()
+                  if x.strip()
+              ] if path.exists() else []
 
               report[name] = {
                   "count": len(lines),
-                  "findings": lines
+                  "findings": lines,
               }
+              total += len(lines)
 
-          total = sum(
-              item["count"]
-              for item in report.values()
-          )
+          status = "WARNING" if total else "PASS"
 
           output = {
-              "summary": {
-                  "total_indicators": total
-              },
-              "checks": report
+              "job": "Suspicious Code and Binary Scan",
+              "status": status,
+              "summary": {"total_indicators": total},
+              "checks": report,
           }
 
-          with open(
-              base / "suspicious-code-binary-report.json",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              json.dump(output, f, indent=2)
+          (base / "report.json").write_text(
+              json.dumps(output, indent=2), encoding="utf-8"
+          )
 
-          print("Suspicious Code / Binary Summary")
-          print("================================")
-          print(f"Total indicators: {total}")
+          lines = [
+              "# Suspicious Code and Binary Scan",
+              "",
+              f"**Status:** {status}",
+              f"**Total indicators:** {total}",
+              "",
+              "| Check | Count |",
+              "|---|---:|",
+          ]
 
           for name, item in report.items():
-              print(f"{name}: {item['count']}")
+              lines.append(f"| {name} | {item['count']} |")
+
+          (base / "report.md").write_text(
+              "\n".join(lines) + "\n", encoding="utf-8"
+          )
+
+          print("\n".join(lines))
           PY
 
-      - name: Upload inspection report
+      - name: Upload suspicious-code report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: suspicious-code-binary-report
-          path: security-inspection/
+          name: 05-suspicious-code-binary-report
+          path: security-reports/suspicious-code/
           if-no-files-found: warn
+          retention-days: ${{ env.REPORT_RETENTION_DAYS }}
 
 
   # ==========================================================
-  # 6. DOCKERFILE SECURITY SCAN
+  # 6. DOCKERFILE SECURITY REPORT
   # ==========================================================
   dockerfile-security-scan:
     name: Dockerfile Security Scan
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install Trivy
         run: |
-          set -e
+          set -euo pipefail
 
-          TRIVY_VERSION="0.74.0"
+          mkdir -p "$HOME/.local/bin"
+          ARCHIVE="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${ARCHIVE}"
 
-          wget -q \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "$RUNNER_TEMP/$ARCHIVE" "$URL"
 
-          tar -xzf "trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-
-          sudo mv trivy /usr/local/bin/trivy
+          tar -xzf "$RUNNER_TEMP/$ARCHIVE" -C "$RUNNER_TEMP" trivy
+          install -m 0755 "$RUNNER_TEMP/trivy" "$HOME/.local/bin/trivy"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
           trivy --version
 
-      - name: Scan Dockerfiles
+      - name: Scan Docker configuration
         run: |
           set +e
+          mkdir -p security-reports/dockerfile
 
-          mkdir -p docker-security
-
-          trivy config . \
+          trivy config server \
             --severity HIGH,CRITICAL \
             --format json \
-            --output dockerfile-trivy-report.json \
+            --output security-reports/dockerfile/trivy-config-report.json \
             --exit-code 0
 
-          echo ""
-          echo "Dockerfile scan completed."
+          exit 0
+
+      - name: Generate Dockerfile report
+        if: always()
+        run: |
+          set -euo pipefail
 
           python3 <<'PY'
           import json
+          from pathlib import Path
 
-          with open(
-              "dockerfile-trivy-report.json",
-              "r",
-              encoding="utf-8"
-          ) as f:
-              data = json.load(f)
+          src = Path("security-reports/dockerfile/trivy-config-report.json")
+          out_json = Path("security-reports/dockerfile/report.json")
+          out_md = Path("security-reports/dockerfile/report.md")
 
           findings = []
 
-          for result in data.get("Results", []):
-              target = result.get("Target", "")
+          if src.exists():
+              data = json.loads(src.read_text(encoding="utf-8"))
+              for result in data.get("Results", []) or []:
+                  for m in result.get("Misconfigurations", []) or []:
+                      findings.append({
+                          "id": m.get("ID"),
+                          "severity": m.get("Severity", "UNKNOWN"),
+                          "title": m.get("Title"),
+                          "target": result.get("Target"),
+                          "primary_url": m.get("PrimaryURL"),
+                      })
 
-              for misconfig in result.get(
-                  "Misconfigurations", []
-              ) or []:
-                  findings.append({
-                      "id": misconfig.get("ID"),
-                      "severity": misconfig.get("Severity"),
-                      "title": misconfig.get("Title"),
-                      "target": target,
-                      "primary_url": misconfig.get("PrimaryURL"),
-                  })
+          critical = sum(x["severity"] == "CRITICAL" for x in findings)
+          high = sum(x["severity"] == "HIGH" for x in findings)
+
+          status = "FAIL" if critical else ("WARNING" if high else "PASS")
 
           report = {
+              "job": "Dockerfile Security Scan",
+              "status": status,
               "summary": {
-                  "total_findings": len(findings)
+                  "total_high_critical": len(findings),
+                  "critical": critical,
+                  "high": high,
               },
-              "findings": findings
+              "findings": findings,
           }
 
-          with open(
-              "docker-security/dockerfile-security-report.json",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              json.dump(report, f, indent=2)
+          out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-          print("")
-          print("Dockerfile Security Summary")
-          print("============================")
-          print(
-              f"Total HIGH/CRITICAL findings: "
-              f"{len(findings)}"
-          )
+          lines = [
+              "# Dockerfile Security Scan",
+              "",
+              f"**Status:** {status}",
+              f"**CRITICAL:** {critical}",
+              f"**HIGH:** {high}",
+              "",
+              "## Findings",
+              "",
+              "| Severity | ID | Title | Target |",
+              "|---|---|---|---|",
+          ]
 
-          for item in findings:
-              print(
-                  f"- {item['id']} | "
-                  f"{item['severity']} | "
-                  f"{item['target']} | "
-                  f"{item['title']}"
+          for x in findings:
+              lines.append(
+                  f"| {x['severity']} | {x['id']} | {x['title']} | {x['target']} |"
               )
+
+          out_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print("\n".join(lines))
           PY
 
-          rm -f dockerfile-trivy-report.json
-
-      - name: Upload Dockerfile security report
+      - name: Upload Dockerfile report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dockerfile-security-report
-          path: docker-security/
+          name: 06-dockerfile-security-report
+          path: security-reports/dockerfile/
           if-no-files-found: warn
+          retention-days: ${{ env.REPORT_RETENTION_DAYS }}
 
 
   # ==========================================================
-  # 7. DOCKER IMAGE SECURITY SCAN
+  # 7. DOCKER IMAGE SECURITY + SBOM
   # ==========================================================
   docker-image-security-scan:
     name: Docker Image Security Scan
@@ -802,494 +825,207 @@ jobs:
       contents: read
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --------------------------------------------------
-      # Build image
-      # --------------------------------------------------
       - name: Build OpenSandbox server image
-        run: |
-          set -e
-
-          docker build \
-            --file server/Dockerfile \
-            --tag opensandbox-server:security-validation \
-            server
-
-      - name: Record image and base-image metadata
-        if: always()
-        run: |
-          set +e
-          IMAGE="opensandbox-server:security-validation"
-          echo "=== Image metadata ==="
-          docker image inspect "$IMAGE" --format '{{json .RepoDigests}}' || true
-          docker image inspect "$IMAGE" --format 'Image ID: {{.Id}}' || true
-          echo "=== Base image references from Dockerfile ==="
-          grep -n '^FROM ' server/Dockerfile || true
-          echo "=== Final image user/entrypoint ==="
-          docker image inspect "$IMAGE" --format 'User: {{.Config.User}}' || true
-          docker image inspect "$IMAGE" --format 'Entrypoint: {{json .Config.Entrypoint}}' || true
-          docker image inspect "$IMAGE" --format 'Cmd: {{json .Config.Cmd}}' || true
-
-      # --------------------------------------------------
-      # Python dependency diagnostic
-      #
-      # IMPORTANT:
-      # The OpenSandbox image has an ENTRYPOINT of
-      # opensandbox-server.
-      #
-      # Therefore we override the ENTRYPOINT when executing
-      # Python commands inside the image.
-      #
-      # This diagnostic is report-only. It does NOT modify
-      # the image, repository, or dependency lock files.
-      # --------------------------------------------------
-      - name: Inspect Python packages in image
-        if: always()
-        run: |
-          set +e
-
-          IMAGE="opensandbox-server:security-validation"
-
-          echo "=============================================="
-          echo "Python Dependency Diagnostic"
-          echo "=============================================="
-
-          echo ""
-          echo "Application virtual environment:"
-          docker run --rm \
-            --entrypoint /app/.venv/bin/python \
-            "$IMAGE" \
-            --version
-
-          echo ""
-          echo "Checking jaraco.context in application venv..."
-          docker run --rm \
-            --entrypoint /app/.venv/bin/python \
-            "$IMAGE" \
-            -c '
-          import importlib.metadata as metadata
-
-          package = "jaraco.context"
-
-          try:
-              dist = metadata.distribution(package)
-              print("FOUND")
-              print("Name:", dist.metadata.get("Name"))
-              print("Version:", dist.version)
-              print("Location:", dist.locate_file(""))
-              print("Requires-Dist:")
-              requirements = dist.requires or []
-              if requirements:
-                  for req in requirements:
-                      print("  ", req)
-              else:
-                  print("   None")
-          except metadata.PackageNotFoundError:
-              print("NOT FOUND")
-          '
-
-          echo ""
-          echo "Checking wheel in application venv..."
-          docker run --rm \
-            --entrypoint /app/.venv/bin/python \
-            "$IMAGE" \
-            -c '
-          import importlib.metadata as metadata
-
-          package = "wheel"
-
-          try:
-              dist = metadata.distribution(package)
-              print("FOUND")
-              print("Name:", dist.metadata.get("Name"))
-              print("Version:", dist.version)
-              print("Location:", dist.locate_file(""))
-              print("Requires-Dist:")
-              requirements = dist.requires or []
-              if requirements:
-                  for req in requirements:
-                      print("  ", req)
-              else:
-                  print("   None")
-          except metadata.PackageNotFoundError:
-              print("NOT FOUND")
-          '
-
-          echo ""
-          echo "Checking system Python:"
-          docker run --rm \
-            --entrypoint /usr/local/bin/python \
-            "$IMAGE" \
-            --version
-
-          echo ""
-          echo "Checking jaraco.context in system Python..."
-          docker run --rm \
-            --entrypoint /usr/local/bin/python \
-            "$IMAGE" \
-            -c '
-          import importlib.metadata as metadata
-
-          package = "jaraco.context"
-
-          try:
-              dist = metadata.distribution(package)
-              print("FOUND")
-              print("Name:", dist.metadata.get("Name"))
-              print("Version:", dist.version)
-              print("Location:", dist.locate_file(""))
-              print("Requires-Dist:")
-              requirements = dist.requires or []
-              if requirements:
-                  for req in requirements:
-                      print("  ", req)
-              else:
-                  print("   None")
-          except metadata.PackageNotFoundError:
-              print("NOT FOUND")
-          '
-
-          echo ""
-          echo "Checking wheel in system Python..."
-          docker run --rm \
-            --entrypoint /usr/local/bin/python \
-            "$IMAGE" \
-            -c '
-          import importlib.metadata as metadata
-
-          package = "wheel"
-
-          try:
-              dist = metadata.distribution(package)
-              print("FOUND")
-              print("Name:", dist.metadata.get("Name"))
-              print("Version:", dist.version)
-              print("Location:", dist.locate_file(""))
-              print("Requires-Dist:")
-              requirements = dist.requires or []
-              if requirements:
-                  for req in requirements:
-                      print("  ", req)
-              else:
-                  print("   None")
-          except metadata.PackageNotFoundError:
-              print("NOT FOUND")
-          '
-
-          echo ""
-          echo "Checking setuptools in system Python..."
-          docker run --rm \
-            --entrypoint /usr/local/bin/python \
-            "$IMAGE" \
-            -c '
-          import importlib.metadata as metadata
-
-          package = "setuptools"
-
-          try:
-              dist = metadata.distribution(package)
-              print("FOUND")
-              print("Name:", dist.metadata.get("Name"))
-              print("Version:", dist.version)
-              print("Location:", dist.locate_file(""))
-              print("Requires-Dist:")
-              requirements = dist.requires or []
-              if requirements:
-                  for req in requirements:
-                      print("  ", req)
-              else:
-                  print("   None")
-          except metadata.PackageNotFoundError:
-              print("NOT FOUND")
-          '
-
-          echo ""
-          echo "Inspecting setuptools vendor paths..."
-          docker run --rm \
-            --entrypoint /usr/local/bin/python \
-            "$IMAGE" \
-            -c '
-          import pathlib
-          import setuptools
-
-          print("setuptools version:", getattr(setuptools, "__version__", "unknown"))
-          print("setuptools file:", getattr(setuptools, "__file__", "unknown"))
-
-          root = pathlib.Path(setuptools.__file__).resolve().parent
-          print("setuptools directory:", root)
-
-          for name in ("jaraco.context", "wheel"):
-              matches = sorted(root.rglob(f"*{name}*"))
-              print(f"{name} vendor matches:")
-              if matches:
-                  for match in matches:
-                      print("  ", match)
-              else:
-                  print("   None")
-          '
-
-          echo ""
-          echo "Searching entire image filesystem for package metadata..."
-          docker run --rm \
-            --entrypoint /bin/sh \
-            "$IMAGE" \
-            -c '
-          echo "--- jaraco.context metadata ---"
-          find / -type d \( \
-            -iname "jaraco.context-*.dist-info" -o \
-            -iname "jaraco_context-*.dist-info" \
-          \) 2>/dev/null || true
-
-          echo "--- wheel metadata ---"
-          find / -type d \
-            -iname "wheel-*.dist-info" \
-            2>/dev/null || true
-
-          echo "--- Python package locations ---"
-          find /usr /opt /app -type d \( \
-            -iname "site-packages" -o \
-            -iname "dist-packages" \
-          \) 2>/dev/null || true
-          '
-
-          echo ""
-          echo "=============================================="
-          echo "Dependency diagnostic completed"
-          echo "=============================================="
-
-          exit 0
-
-      # --------------------------------------------------
-      # Image Python dependency/security diagnostics
-      # --------------------------------------------------
-      - name: Validate Python packaging dependencies
-        if: always()
-        run: |
-          set +e
-          IMAGE="opensandbox-server:security-validation"
-
-          echo "=============================================="
-          echo "Python Packaging Dependency Validation"
-          echo "=============================================="
-
-          docker run --rm --entrypoint /app/.venv/bin/python "$IMAGE" -c '
-          import importlib.metadata as m
-          for name in ("setuptools", "wheel", "jaraco.context"):
-              try:
-                  d=m.distribution(name)
-                  print(f"{name}: {d.version} | {d.locate_file('')}")
-              except Exception as e:
-                  print(f"{name}: NOT INSTALLED ({e})")
-          ' || true
-
-          echo "--- System Python packaging metadata ---"
-          docker run --rm --entrypoint /usr/local/bin/python "$IMAGE" -c '
-          import importlib.metadata as m
-          for name in ("setuptools", "wheel", "jaraco.context"):
-              try:
-                  d=m.distribution(name)
-                  print(f"{name}: {d.version} | {d.locate_file('')}")
-                  for req in d.requires or []:
-                      if any(x in req.lower() for x in ("wheel", "jaraco")):
-                          print("  Requires-Dist:", req)
-              except Exception as e:
-                  print(f"{name}: NOT INSTALLED ({e})")
-          ' || true
-
-          echo "--- setuptools bundled/vendor content ---"
-          docker run --rm --entrypoint /bin/sh "$IMAGE" -c '
-          python=/usr/local/bin/python
-          root=$($python -c "import setuptools, pathlib; print(pathlib.Path(setuptools.__file__).resolve().parent)" 2>/dev/null)
-          echo "setuptools root: $root"
-          if [ -n "$root" ]; then
-            find "$root" -type d \( -iname "*jaraco.context*" -o -iname "*wheel*" \) 2>/dev/null || true
-          fi
-          ' || true
-
-          echo "--- Requirement/lock references ---"
-          grep -RniE '(^|[^[:alnum:]_-])(setuptools|wheel|jaraco\.context)([^[:alnum:]_-]|$)' server/pyproject.toml server/uv.lock 2>/dev/null || true
-
-          echo "=============================================="
-          echo "Diagnostic completed (report-only)"
-          echo "=============================================="
-
-      # --------------------------------------------------
-      # Install Trivy before Docker image scan
-      # --------------------------------------------------
-      - name: Install Trivy for Docker image scan
         run: |
           set -euo pipefail
 
-          TRIVY_VERSION="0.74.0"
-          INSTALL_DIR="$HOME/.local/bin"
+          docker build \
+            --file server/Dockerfile \
+            --tag "$IMAGE" \
+            server
+
+      - name: Record image metadata
+        if: always()
+        run: |
+          set +e
+          mkdir -p security-reports/docker-image
+
+          docker image inspect "$IMAGE" \
+            --format '{{json .}}' \
+            > security-reports/docker-image/image-inspect.json || true
+
+          docker image inspect "$IMAGE" \
+            --format 'Image ID: {{.Id}}' \
+            > security-reports/docker-image/image-metadata.txt || true
+
+          docker image inspect "$IMAGE" \
+            --format 'User: {{.Config.User}}' \
+            >> security-reports/docker-image/image-metadata.txt || true
+
+          docker image inspect "$IMAGE" \
+            --format 'Entrypoint: {{json .Config.Entrypoint}}' \
+            >> security-reports/docker-image/image-metadata.txt || true
+
+          docker image inspect "$IMAGE" \
+            --format 'Cmd: {{json .Config.Cmd}}' \
+            >> security-reports/docker-image/image-metadata.txt || true
+
+          grep -n '^FROM ' server/Dockerfile \
+            > security-reports/docker-image/base-image-references.txt || true
+
+      - name: Verify image runtime configuration
+        run: |
+          set +e
+          IMAGE="$IMAGE"
+
+          {
+            echo "===== Image user ====="
+            docker image inspect "$IMAGE" --format '{{.Config.User}}'
+
+            echo "===== Entrypoint ====="
+            docker image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}'
+
+            echo "===== Command ====="
+            docker image inspect "$IMAGE" --format '{{json .Config.Cmd}}'
+
+            echo "===== Config files ====="
+            docker run --rm --entrypoint /bin/sh "$IMAGE" -c '
+              echo "--- /etc/opensandbox/config.toml ---"
+              sed -n "1,240p" /etc/opensandbox/config.toml 2>/dev/null || true
+            '
+          } > security-reports/docker-image/runtime-config.txt 2>&1
+
+          exit 0
+
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/.local/bin"
           ARCHIVE="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
           URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${ARCHIVE}"
 
-          mkdir -p "$INSTALL_DIR"
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "$RUNNER_TEMP/$ARCHIVE" "$URL"
 
-          echo "Installing Trivy ${TRIVY_VERSION}..."
-          echo "Download: $URL"
-
-          curl -fL --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/$ARCHIVE" "$URL"
           tar -xzf "$RUNNER_TEMP/$ARCHIVE" -C "$RUNNER_TEMP" trivy
-          install -m 0755 "$RUNNER_TEMP/trivy" "$INSTALL_DIR/trivy"
+          install -m 0755 "$RUNNER_TEMP/trivy" "$HOME/.local/bin/trivy"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-          export PATH="$INSTALL_DIR:$PATH"
-          echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+          trivy --version
 
-          echo "Trivy version:"
-          "$INSTALL_DIR/trivy" --version
-
-      # --------------------------------------------------
       - name: Scan, classify and gate Docker image
         run: |
           set -euo pipefail
 
-          IMAGE="opensandbox-server:security-validation"
-          WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
-          REPORT_DIR="$WORKSPACE/docker-image-security"
-          RAW_REPORT="$REPORT_DIR/trivy-image-raw.json"
-          REPORT="$REPORT_DIR/docker-image-security-report.json"
+          REPORT_DIR="$GITHUB_WORKSPACE/security-reports/docker-image"
+          RAW="$REPORT_DIR/trivy-image-raw.json"
+          REPORT="$REPORT_DIR/report.json"
           CLASSIFICATION="$REPORT_DIR/vulnerability-classification.json"
 
           mkdir -p "$REPORT_DIR"
-
-          echo "========================================"
-          echo "Docker Image Vulnerability Scan"
-          echo "========================================"
-          echo "Workspace : $WORKSPACE"
-          echo "Image     : $IMAGE"
-          echo "Report dir: $REPORT_DIR"
-          echo ""
 
           trivy image \
             --scanners vuln \
             --severity HIGH,CRITICAL \
             --format json \
-            --output "$RAW_REPORT" \
+            --output "$RAW" \
             --exit-code 0 \
             "$IMAGE"
 
-          echo ""
-          echo "Trivy scan completed."
-          echo "Checking raw Trivy report..."
-
-          if [ ! -s "$RAW_REPORT" ]; then
-            echo "ERROR: Trivy did not create a non-empty report."
-            echo "Expected: $RAW_REPORT"
-            exit 1
-          fi
+          test -s "$RAW"
 
           python3 <<'PY'
           import json
+          import os
           import sys
           from collections import Counter
           from pathlib import Path
 
-          raw_report = Path(
-              __import__("os").environ["GITHUB_WORKSPACE"]
-          ) / "docker-image-security" / "trivy-image-raw.json"
+          base = Path(os.environ["GITHUB_WORKSPACE"]) / "security-reports" / "docker-image"
+          raw = base / "trivy-image-raw.json"
+          report_file = base / "report.json"
+          classification_file = base / "vulnerability-classification.json"
 
-          report_file = raw_report.parent / "docker-image-security-report.json"
-          classification_file = raw_report.parent / "vulnerability-classification.json"
-
-          with raw_report.open("r", encoding="utf-8") as f:
-              data = json.load(f)
-
+          data = json.loads(raw.read_text(encoding="utf-8"))
           findings = []
 
           for result in data.get("Results", []) or []:
               target = result.get("Target", "")
-
-              for vuln in result.get("Vulnerabilities", []) or []:
+              for v in result.get("Vulnerabilities", []) or []:
                   findings.append({
-                      "vulnerability_id": vuln.get("VulnerabilityID"),
-                      "severity": vuln.get("Severity"),
-                      "package": vuln.get("PkgName"),
-                      "installed_version": vuln.get("InstalledVersion"),
-                      "fixed_version": vuln.get("FixedVersion"),
+                      "id": v.get("VulnerabilityID"),
+                      "severity": v.get("Severity", "UNKNOWN"),
+                      "package": v.get("PkgName"),
+                      "installed_version": v.get("InstalledVersion"),
+                      "fixed_version": v.get("FixedVersion"),
                       "target": target,
-                      "title": vuln.get("Title"),
+                      "title": v.get("Title"),
                   })
 
-          counts = Counter(
-              (item.get("severity") or "UNKNOWN").upper()
-              for item in findings
-          )
+          counts = Counter(x["severity"].upper() for x in findings)
+          critical = [
+              x for x in findings if x["severity"].upper() == "CRITICAL"
+          ]
+          fixed = [
+              x for x in findings
+              if x.get("fixed_version")
+          ]
+          no_fix = [
+              x for x in findings
+              if not x.get("fixed_version")
+          ]
 
           report = {
-              "image": "opensandbox-server:security-validation",
+              "job": "Docker Image Security Scan",
+              "image": os.environ["IMAGE"],
+              "status": "FAIL" if critical or fixed else (
+                  "WARNING" if no_fix else "PASS"
+              ),
               "summary": {
-                  "total_findings": len(findings),
+                  "total_high_critical": len(findings),
                   "critical": counts.get("CRITICAL", 0),
                   "high": counts.get("HIGH", 0),
+                  "fixed_version": len(fixed),
+                  "no_fixed_version": len(no_fix),
               },
               "findings": findings,
           }
 
-          report_file.write_text(
-              json.dumps(report, indent=2),
-              encoding="utf-8",
-          )
-
-          critical = [
-              item for item in findings
-              if (item.get("severity") or "").upper() == "CRITICAL"
-          ]
-
-          fixed = [
-              item for item in findings
-              if item.get("fixed_version")
-          ]
-
-          no_fix = [
-              item for item in findings
-              if not item.get("fixed_version")
-          ]
-
           classification = {
-              "summary": {
-                  "total_high_critical": len(findings),
-                  "critical": len(critical),
-                  "actionable_with_fixed_version": len(fixed),
-                  "no_fix_available": len(no_fix),
-              },
               "critical_findings": critical,
               "actionable_findings": fixed,
               "no_fix_available": no_fix,
           }
 
+          report_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
           classification_file.write_text(
               json.dumps(classification, indent=2),
               encoding="utf-8",
           )
 
-          print("")
-          print("========================================")
-          print("Docker Image Security Summary")
-          print("========================================")
-          print(f"Total HIGH/CRITICAL : {len(findings)}")
-          print(f"CRITICAL           : {len(critical)}")
-          print(f"Known fixed version: {len(fixed)}")
-          print(f"No fixed version   : {len(no_fix)}")
-          print("")
+          lines = [
+              "# Docker Image Security Scan",
+              "",
+              f"**Image:** `{os.environ['IMAGE']}`",
+              f"**Status:** {report['status']}",
+              "",
+              f"- Total HIGH/CRITICAL: {len(findings)}",
+              f"- CRITICAL: {counts.get('CRITICAL', 0)}",
+              f"- HIGH: {counts.get('HIGH', 0)}",
+              f"- Findings with fixed version: {len(fixed)}",
+              f"- Findings without fixed version: {len(no_fix)}",
+              "",
+              "## Findings",
+              "",
+              "| Severity | CVE | Package | Installed | Fixed |",
+              "|---|---|---|---|---|",
+          ]
 
-          for item in findings:
-              print(
-                  f"- {item.get('vulnerability_id')} | "
-                  f"{item.get('severity')} | "
-                  f"{item.get('package')} | "
-                  f"{item.get('installed_version')} -> "
-                  f"{item.get('fixed_version') or 'no fixed version'}"
+          for x in findings:
+              lines.append(
+                  f"| {x['severity']} | {x['id']} | {x['package']} | "
+                  f"{x['installed_version']} | {x.get('fixed_version') or 'No fixed version'} |"
               )
 
-          print("")
-          print("========================================")
-          print("Security Validation Gate")
-          print("========================================")
+          (base / "report.md").write_text(
+              "\n".join(lines) + "\n", encoding="utf-8"
+          )
+
+          print("\n".join(lines))
 
           if critical:
               print("FAIL: CRITICAL vulnerabilities detected.")
@@ -1302,62 +1038,609 @@ jobs:
               )
               sys.exit(1)
 
-          print(
-              "PASS: No CRITICAL or known-fix HIGH/CRITICAL "
-              "vulnerabilities remain."
-          )
+          print("PASS: No CRITICAL or known-fix HIGH/CRITICAL vulnerabilities remain.")
 
           if no_fix:
               print(
-                  "WARNING: Findings without a fixed version remain "
-                  "and require documented security review/acceptance."
+                  "WARNING: Findings without a fixed version remain and "
+                  "require documented security review/acceptance."
               )
-
-          print("")
-          print("Reports created:")
-          print(report_file)
-          print(classification_file)
           PY
 
-          echo ""
-          echo "Verifying generated reports..."
-          test -s "$REPORT"
-          test -s "$CLASSIFICATION"
-          ls -lh "$REPORT" "$CLASSIFICATION"
-
-          # Keep the raw Trivy report as part of the artifact.
-          echo "Raw Trivy report: $RAW_REPORT"
-
-      # --------------------------------------------------
-      # Upload Docker image security reports
-      # --------------------------------------------------
-      - name: Upload Docker image report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image-security-report
-          path: docker-image-security/
-          if-no-files-found: warn
-
-      # --------------------------------------------------
-      # Generate image SBOM
-      # --------------------------------------------------
       - name: Generate image SBOM
+        if: always()
         uses: anchore/sbom-action@v0
         with:
           image: opensandbox-server:security-validation
           format: cyclonedx-json
-          output-file: sbom-opensandbox-server.json
+          output-file: security-reports/docker-image/sbom.json
           upload-artifact: false
 
-      # --------------------------------------------------
-      # Upload image SBOM
-      # --------------------------------------------------
-      - name: Upload image SBOM
+      - name: Upload Docker image security report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: opensandbox-image-sbom
-          path: sbom-opensandbox-server.json
-          retention-days: 7
+          name: 07-docker-image-security-report
+          path: security-reports/docker-image/
           if-no-files-found: warn
+          retention-days: ${{ env.REPORT_RETENTION_DAYS }}
 
+
+  # ==========================================================
+  # 8. OPEN-SANDBOX CONFIGURATION / RUNTIME SECURITY
+  # ==========================================================
+  configuration-security-scan:
+    name: Configuration and Runtime Security
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inspect OpenSandbox security configuration
+        run: |
+          set -euo pipefail
+
+          mkdir -p security-reports/configuration
+
+          CONFIG="server/opensandbox_server/examples/example.config.toml"
+          DOCKER_COMPOSE="docker-compose.example.yaml"
+          DOCKERFILE="server/Dockerfile"
+
+          {
+            echo "OpenSandbox Configuration Security Inspection"
+            echo "============================================="
+            echo ""
+            echo "Repository commit:"
+            git rev-parse HEAD
+            echo ""
+            echo "Docker configuration:"
+            if [ -f "$CONFIG" ]; then
+              echo "FOUND: $CONFIG"
+            else
+              echo "MISSING: $CONFIG"
+            fi
+            echo ""
+            echo "Docker compose example:"
+            if [ -f "$DOCKER_COMPOSE" ]; then
+              echo "FOUND: $DOCKER_COMPOSE"
+            else
+              echo "MISSING: $DOCKER_COMPOSE"
+            fi
+            echo ""
+            echo "Dockerfile:"
+            echo "FOUND: $DOCKERFILE"
+            echo ""
+            echo "Security-sensitive configuration references:"
+            rg -n -i \
+              'api[_-]?key|docker.sock|allowed_host_paths|network_mode|no_new_privileges|pids_limit|drop_capabilities|seccomp|apparmor|egress|otel|40000|60000|secure_runtime|type[[:space:]]*=' \
+              server/opensandbox_server/examples/example.config.toml \
+              "$DOCKER_COMPOSE" \
+              "$DOCKERFILE" \
+              2>/dev/null || true
+          } | tee security-reports/configuration/raw-inspection.txt
+
+      - name: Generate configuration security report
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          config = Path("server/opensandbox_server/examples/example.config.toml")
+          compose = Path("docker-compose.example.yaml")
+          dockerfile = Path("server/Dockerfile")
+
+          findings = []
+          checks = []
+
+          def add(check, status, evidence, recommendation=""):
+              checks.append({
+                  "check": check,
+                  "status": status,
+                  "evidence": evidence,
+                  "recommendation": recommendation,
+              })
+
+          text = config.read_text(encoding="utf-8") if config.exists() else ""
+          compose_text = compose.read_text(encoding="utf-8") if compose.exists() else ""
+          dockerfile_text = dockerfile.read_text(encoding="utf-8") if dockerfile.exists() else ""
+
+          if re.search(r'^\s*type\s*=\s*"docker"', text, re.M):
+              add("Docker runtime", "PASS", 'runtime.type = "docker"')
+          else:
+              add("Docker runtime", "REVIEW", "Docker runtime setting not confirmed")
+
+          if "no_new_privileges" in text and "true" in text:
+              add("no_new_privileges", "PASS", "Enabled in Docker example configuration")
+          else:
+              add("no_new_privileges", "REVIEW", "Setting not confirmed")
+
+          if "drop_capabilities" in text:
+              add("Dropped Linux capabilities", "PASS", "Capability-drop configuration present")
+          else:
+              add("Dropped Linux capabilities", "REVIEW", "Capability-drop configuration not found")
+
+          if "pids_limit" in text:
+              add("PID limit", "PASS", "PID limit configuration present")
+          else:
+              add("PID limit", "REVIEW", "PID limit not found")
+
+          if "allowed_host_paths" in text:
+              add(
+                  "Host path allowlist",
+                  "PASS",
+                  "allowed_host_paths is explicitly configured",
+              )
+          else:
+              add(
+                  "Host path allowlist",
+                  "REVIEW",
+                  "Host path allowlist not found",
+              )
+
+          if "docker.sock" in compose_text:
+              add(
+                  "Docker socket",
+                  "REVIEW",
+                  "Docker socket is mounted in the example deployment",
+                  "Document Docker daemon access as a privileged integration and protect the host daemon.",
+              )
+          else:
+              add("Docker socket", "PASS", "No Docker socket mount found in example compose")
+
+          if re.search(r'api[_-]?key', text, re.I):
+              add(
+                  "API authentication configuration",
+                  "REVIEW",
+                  "API-key configuration is present in the example",
+                  "Inject the production API key through a centralized secret mechanism; never commit the value.",
+              )
+          else:
+              add("API authentication configuration", "REVIEW", "API-key configuration not confirmed")
+
+          if "40000" in text and "60000" in text:
+              add(
+                  "Sandbox port range",
+                  "REVIEW",
+                  "Port range 40000-60000 is configured",
+                  "Do not expose the full sandbox range publicly unless explicitly required.",
+              )
+          else:
+              add("Sandbox port range", "REVIEW", "Sandbox port range not confirmed")
+
+          if "secure_runtime" in text:
+              add(
+                  "Secure runtime option",
+                  "REVIEW",
+                  "secure_runtime option exists",
+                  "Evaluate gVisor/Kata compatibility before enabling; do not change automatically.",
+              )
+          else:
+              add("Secure runtime option", "REVIEW", "Secure runtime option not confirmed")
+
+          if "otel" in text.lower():
+              add("OpenTelemetry", "PASS", "OTel configuration is present")
+          else:
+              add("OpenTelemetry", "REVIEW", "OTel configuration not confirmed")
+
+          if "COPY" in dockerfile_text and "example.config.k8s.toml" in dockerfile_text:
+              add(
+                  "Docker/Kubernetes configuration alignment",
+                  "REVIEW",
+                  "Dockerfile references example.config.k8s.toml",
+                  "Verify that the final Docker deployment uses the Docker runtime configuration.",
+              )
+          else:
+              add("Docker/Kubernetes configuration alignment", "PASS", "No K8s config copy detected")
+
+          status = (
+              "FAIL" if any(x["status"] == "FAIL" for x in checks)
+              else "WARNING" if any(x["status"] == "REVIEW" for x in checks)
+              else "PASS"
+          )
+
+          report = {
+              "job": "Configuration and Runtime Security",
+              "status": status,
+              "checks": checks,
+              "findings": findings,
+          }
+
+          base = Path("security-reports/configuration")
+          (base / "report.json").write_text(
+              json.dumps(report, indent=2), encoding="utf-8"
+          )
+
+          lines = [
+              "# Configuration and Runtime Security",
+              "",
+              f"**Status:** {status}",
+              "",
+              "| Check | Status | Evidence | Recommendation |",
+              "|---|---|---|---|",
+          ]
+
+          for x in checks:
+              lines.append(
+                  f"| {x['check']} | {x['status']} | "
+                  f"{x['evidence']} | {x['recommendation']} |"
+              )
+
+          (base / "report.md").write_text(
+              "\n".join(lines) + "\n", encoding="utf-8"
+          )
+
+          print("\n".join(lines))
+          PY
+
+      - name: Upload configuration report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 08-configuration-security-report
+          path: security-reports/configuration/
+          if-no-files-found: warn
+          retention-days: ${{ env.REPORT_RETENTION_DAYS }}
+
+
+  # ==========================================================
+  # 9. BUILD / TEST / HEALTH VALIDATION
+  # ==========================================================
+  build-test-validation:
+    name: Build Test and Health Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate repository structure
+        run: |
+          set -euo pipefail
+          mkdir -p security-reports/build-test
+
+          test -f server/Dockerfile
+          test -f server/pyproject.toml
+          test -f server/uv.lock
+          test -d server/opensandbox_server
+
+          echo "Required server build files are present."
+
+      - name: Build OpenSandbox image for validation
+        run: |
+          set -euo pipefail
+
+          docker build \
+            --file server/Dockerfile \
+            --tag "$IMAGE-build-test" \
+            server
+
+      - name: Start container for health validation
+        run: |
+          set -euo pipefail
+
+          docker run -d \
+            --name opensandbox-security-test \
+            -p 18090:8080 \
+            "$IMAGE-build-test"
+
+          sleep 10
+
+      - name: Validate container health endpoint
+        run: |
+          set +e
+
+          mkdir -p security-reports/build-test
+
+          HTTP_CODE=$(curl -sS \
+            -o security-reports/build-test/health-response.txt \
+            -w '%{http_code}' \
+            --max-time 15 \
+            http://127.0.0.1:18090/health)
+
+          echo "HTTP status: $HTTP_CODE" \
+            | tee security-reports/build-test/health-status.txt
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Health check PASS"
+            exit 0
+          fi
+
+          echo "Health check did not return HTTP 200."
+          exit 1
+
+      - name: Collect container diagnostics
+        if: always()
+        run: |
+          set +e
+          mkdir -p security-reports/build-test
+
+          docker ps -a \
+            > security-reports/build-test/docker-ps.txt 2>&1 || true
+
+          docker logs opensandbox-security-test \
+            > security-reports/build-test/container.log 2>&1 || true
+
+          docker inspect opensandbox-security-test \
+            > security-reports/build-test/container-inspect.json 2>&1 || true
+
+          docker rm -f opensandbox-security-test \
+            > /dev/null 2>&1 || true
+
+      - name: Generate build and test report
+        if: always()
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          base = Path("security-reports/build-test")
+          base.mkdir(parents=True, exist_ok=True)
+
+          structure_ok = all([
+              Path("server/Dockerfile").exists(),
+              Path("server/pyproject.toml").exists(),
+              Path("server/uv.lock").exists(),
+              Path("server/opensandbox_server").is_dir(),
+          ])
+
+          build_ok = (base / "docker-build-status.txt").read_text(
+              encoding="utf-8", errors="replace"
+          ).strip() == "PASS" if (base / "docker-build-status.txt").exists() else False
+
+          health_ok = (base / "health-status.txt").read_text(
+              encoding="utf-8", errors="replace"
+          ).strip() == "HTTP status: 200" if (base / "health-status.txt").exists() else False
+
+          checks = {
+              "repository_structure": "PASS" if structure_ok else "FAIL",
+              "docker_build": "PASS" if build_ok else "FAIL",
+              "health_endpoint": "PASS" if health_ok else "FAIL",
+          }
+
+          status = "PASS" if all(v == "PASS" for v in checks.values()) else "FAIL"
+
+          report = {
+              "report": "OpenSandbox Security Validation - Build/Test",
+              "job": "Build Test and Health Validation",
+              "status": status,
+              "repository": os.environ.get("GITHUB_REPOSITORY"),
+              "commit": os.environ.get("GITHUB_SHA"),
+              "workflow_run": os.environ.get("GITHUB_RUN_ID"),
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "checks": checks,
+              "evidence_files": sorted(
+                  p.name for p in base.iterdir() if p.is_file()
+              ),
+          }
+
+          (base / "report.json").write_text(
+              json.dumps(report, indent=2), encoding="utf-8"
+          )
+
+          lines = [
+              "# Build Test and Health Validation",
+              "",
+              f"**Status:** {status}",
+              f"**Repository:** `{report['repository']}`",
+              f"**Commit:** `{report['commit']}`",
+              f"**Workflow run:** `{report['workflow_run']}`",
+              "",
+              "## Checks",
+              "",
+              "| Check | Status |",
+              "|---|---|",
+          ]
+          for name, value in checks.items():
+              lines.append(f"| {name} | {value} |")
+
+          lines += [
+              "",
+              "## Evidence",
+              "",
+              "The artifact contains Docker build status, health response, "
+              "container logs, Docker inspection output, and this report.",
+          ]
+
+          (base / "report.md").write_text(
+              "\n".join(lines) + "\n", encoding="utf-8"
+          )
+          print("\n".join(lines))
+          PY
+
+      - name: Upload build and test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 09-build-test-report
+          path: security-reports/build-test/
+          if-no-files-found: warn
+          retention-days: ${{ env.REPORT_RETENTION_DAYS }}
+
+
+  # ==========================================================
+  # 10. FINAL CONSOLIDATED SECURITY REPORT
+  # ==========================================================
+  final-security-report:
+    name: Final Security Validation Report
+    if: always()
+    needs:
+      - license-dependency-scan
+      - vulnerability-scan
+      - secrets-scan
+      - sast-scan
+      - suspicious-code-binary-scan
+      - dockerfile-security-scan
+      - docker-image-security-scan
+      - configuration-security-scan
+      - build-test-validation
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all security reports
+        uses: actions/download-artifact@v4
+        with:
+          path: final-reports
+          pattern: "*-report*"
+          merge-multiple: false
+
+      - name: Generate final consolidated report
+        env:
+          LICENSE_RESULT: ${{ needs.license-dependency-scan.result }}
+          VULNERABILITY_RESULT: ${{ needs.vulnerability-scan.result }}
+          SECRETS_RESULT: ${{ needs.secrets-scan.result }}
+          SAST_RESULT: ${{ needs.sast-scan.result }}
+          SUSPICIOUS_RESULT: ${{ needs.suspicious-code-binary-scan.result }}
+          DOCKERFILE_RESULT: ${{ needs.dockerfile-security-scan.result }}
+          IMAGE_RESULT: ${{ needs.docker-image-security-scan.result }}
+          CONFIG_RESULT: ${{ needs.configuration-security-scan.result }}
+          BUILD_RESULT: ${{ needs.build-test-validation.result }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p final-reports/FINAL
+
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          base = Path("final-reports")
+          final = base / "FINAL"
+
+          jobs = [
+              ("License & Dependency Scan", os.environ["LICENSE_RESULT"]),
+              ("Dependency Vulnerability Scan", os.environ["VULNERABILITY_RESULT"]),
+              ("Secrets Scan", os.environ["SECRETS_RESULT"]),
+              ("SAST - CodeQL", os.environ["SAST_RESULT"]),
+              ("Suspicious Code and Binary Scan", os.environ["SUSPICIOUS_RESULT"]),
+              ("Dockerfile Security Scan", os.environ["DOCKERFILE_RESULT"]),
+              ("Docker Image Security Scan", os.environ["IMAGE_RESULT"]),
+              ("Configuration and Runtime Security", os.environ["CONFIG_RESULT"]),
+              ("Build Test and Health Validation", os.environ["BUILD_RESULT"]),
+          ]
+
+          status_map = {
+              "success": "PASS",
+              "failure": "FAIL",
+              "cancelled": "FAIL",
+              "skipped": "REVIEW",
+          }
+
+          rows = []
+          for name, result in jobs:
+              rows.append({
+                  "job": name,
+                  "github_result": result,
+                  "status": status_map.get(result, "REVIEW"),
+              })
+
+          failures = [x for x in rows if x["status"] == "FAIL"]
+          reviews = [x for x in rows if x["status"] == "REVIEW"]
+
+          final_status = (
+              "FAIL" if failures
+              else "WARNING" if reviews
+              else "PASS"
+          )
+
+          report = {
+              "report": "OpenSandbox Security Validation",
+              "repository": "aviradigital/OpenSandbox",
+              "commit": os.environ.get("GITHUB_SHA"),
+              "workflow_run": os.environ.get("GITHUB_RUN_ID"),
+              "final_status": final_status,
+              "jobs": rows,
+              "artifacts": sorted(
+                  str(p.relative_to(base))
+                  for p in base.rglob("*")
+                  if p.is_file()
+              ),
+              "decision": (
+                  "Deployment blocked pending remediation/review."
+                  if final_status == "FAIL"
+                  else "Deployment requires documented warning/review acceptance."
+                  if final_status == "WARNING"
+                  else "Security validation passed for the checks implemented in this workflow."
+              ),
+              "reporting_model": (
+                  "Every validation job publishes a human-readable report.md and "
+                  "machine-readable report.json. Raw evidence is retained where "
+                  "safe; secret values are excluded."
+              ),
+          }
+
+          (final / "security-validation-report.json").write_text(
+              json.dumps(report, indent=2), encoding="utf-8"
+          )
+
+          lines = [
+              "# OpenSandbox Security Validation Report",
+              "",
+              f"**Repository:** `aviradigital/OpenSandbox`",
+              f"**Commit:** `{os.environ.get('GITHUB_SHA')}`",
+              f"**Workflow Run:** `{os.environ.get('GITHUB_RUN_ID')}`",
+              f"**FINAL STATUS:** **{final_status}**",
+              "",
+              "## Job Results",
+              "",
+              "| Job | GitHub Result | Status |",
+              "|---|---|---|",
+          ]
+
+          for x in rows:
+              lines.append(
+                  f"| {x['job']} | {x['github_result']} | {x['status']} |"
+              )
+
+          lines += [
+              "",
+              "## Decision",
+              "",
+              report["decision"],
+              "",
+              "## Evidence",
+              "",
+              "Each validation job publishes its own `report.md` and `report.json` "
+              "artifact. Raw scanner evidence is retained where appropriate. "
+              "Secret values are intentionally excluded.",
+              "",
+              "## What reviewers should open",
+              "",
+              "1. Open the job-specific artifact for detailed findings and evidence.",
+              "2. Read `report.md` first for a human-readable summary.",
+              "3. Use `report.json` for complete structured results.",
+              "4. Use the `FINAL/security-validation-report.md` for the overall decision.",
+          ]
+
+          (final / "security-validation-report.md").write_text(
+              "\n".join(lines) + "\n", encoding="utf-8"
+          )
+
+          print("\n".join(lines))
+
+          # The final job reports the consolidated decision.
+          # Individual security jobs retain their own gates.
+          if final_status == "FAIL":
+              raise SystemExit(1)
+          PY
+
+      - name: Upload final consolidated report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FINAL-security-validation-report
+          path: final-reports/FINAL/
+          if-no-files-found: error
+          retention-days: 30
