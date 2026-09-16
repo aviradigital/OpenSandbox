@@ -818,6 +818,21 @@ jobs:
             --tag opensandbox-server:security-validation \
             server
 
+      - name: Record image and base-image metadata
+        if: always()
+        run: |
+          set +e
+          IMAGE="opensandbox-server:security-validation"
+          echo "=== Image metadata ==="
+          docker image inspect "$IMAGE" --format '{{json .RepoDigests}}' || true
+          docker image inspect "$IMAGE" --format 'Image ID: {{.Id}}' || true
+          echo "=== Base image references from Dockerfile ==="
+          grep -n '^FROM ' server/Dockerfile || true
+          echo "=== Final image user/entrypoint ==="
+          docker image inspect "$IMAGE" --format 'User: {{.Config.User}}' || true
+          docker image inspect "$IMAGE" --format 'Entrypoint: {{json .Config.Entrypoint}}' || true
+          docker image inspect "$IMAGE" --format 'Cmd: {{json .Config.Cmd}}' || true
+
       # --------------------------------------------------
       # Python dependency diagnostic
       #
@@ -1048,6 +1063,60 @@ jobs:
           exit 0
 
       # --------------------------------------------------
+      # Image Python dependency/security diagnostics
+      # --------------------------------------------------
+      - name: Validate Python packaging dependencies
+        if: always()
+        run: |
+          set +e
+          IMAGE="opensandbox-server:security-validation"
+
+          echo "=============================================="
+          echo "Python Packaging Dependency Validation"
+          echo "=============================================="
+
+          docker run --rm --entrypoint /app/.venv/bin/python "$IMAGE" -c '
+          import importlib.metadata as m
+          for name in ("setuptools", "wheel", "jaraco.context"):
+              try:
+                  d=m.distribution(name)
+                  print(f"{name}: {d.version} | {d.locate_file("")}")
+              except Exception as e:
+                  print(f"{name}: NOT INSTALLED ({e})")
+          ' || true
+
+          echo "--- System Python packaging metadata ---"
+          docker run --rm --entrypoint /usr/local/bin/python "$IMAGE" -c '
+          import importlib.metadata as m
+          for name in ("setuptools", "wheel", "jaraco.context"):
+              try:
+                  d=m.distribution(name)
+                  print(f"{name}: {d.version} | {d.locate_file("")}")
+                  for req in d.requires or []:
+                      if any(x in req.lower() for x in ("wheel", "jaraco")):
+                          print("  Requires-Dist:", req)
+              except Exception as e:
+                  print(f"{name}: NOT INSTALLED ({e})")
+          ' || true
+
+          echo "--- setuptools bundled/vendor content ---"
+          docker run --rm --entrypoint /bin/sh "$IMAGE" -c '
+          python=/usr/local/bin/python
+          root=$($python -c "import setuptools, pathlib; print(pathlib.Path(setuptools.__file__).resolve().parent)" 2>/dev/null)
+          echo "setuptools root: $root"
+          if [ -n "$root" ]; then
+            find "$root" -type d \( -iname "*jaraco.context*" -o -iname "*wheel*" \) 2>/dev/null || true
+          fi
+          ' || true
+
+          echo "--- Requirement/lock references ---"
+          grep -RniE '(^|[^[:alnum:]_-])(setuptools|wheel|jaraco\.context)([^[:alnum:]_-]|$)' server/pyproject.toml server/uv.lock 2>/dev/null || true
+
+          echo "=============================================="
+          echo "Diagnostic completed (report-only)"
+          echo "=============================================="
+
+      # --------------------------------------------------
       # Generate image SBOM
       # --------------------------------------------------
       - name: Generate image SBOM
@@ -1143,6 +1212,8 @@ jobs:
               finding.get("severity") or "UNKNOWN"
               for finding in findings
           )
+          fixable = [f for f in findings if f.get("fixed_version")]
+          no_fix = [f for f in findings if not f.get("fixed_version")]
 
           report = {
               "image": "opensandbox-server:security-validation",
