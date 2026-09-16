@@ -965,6 +965,58 @@ jobs:
           '
 
           echo ""
+          echo "Checking setuptools in system Python..."
+          docker run --rm \
+            --entrypoint /usr/local/bin/python \
+            "$IMAGE" \
+            -c '
+          import importlib.metadata as metadata
+
+          package = "setuptools"
+
+          try:
+              dist = metadata.distribution(package)
+              print("FOUND")
+              print("Name:", dist.metadata.get("Name"))
+              print("Version:", dist.version)
+              print("Location:", dist.locate_file(""))
+              print("Requires-Dist:")
+              requirements = dist.requires or []
+              if requirements:
+                  for req in requirements:
+                      print("  ", req)
+              else:
+                  print("   None")
+          except metadata.PackageNotFoundError:
+              print("NOT FOUND")
+          '
+
+          echo ""
+          echo "Inspecting setuptools vendor paths..."
+          docker run --rm \
+            --entrypoint /usr/local/bin/python \
+            "$IMAGE" \
+            -c '
+          import pathlib
+          import setuptools
+
+          print("setuptools version:", getattr(setuptools, "__version__", "unknown"))
+          print("setuptools file:", getattr(setuptools, "__file__", "unknown"))
+
+          root = pathlib.Path(setuptools.__file__).resolve().parent
+          print("setuptools directory:", root)
+
+          for name in ("jaraco.context", "wheel"):
+              matches = sorted(root.rglob(f"*{name}*"))
+              print(f"{name} vendor matches:")
+              if matches:
+                  for match in matches:
+                      print("  ", match)
+              else:
+                  print("   None")
+          '
+
+          echo ""
           echo "Searching entire image filesystem for package metadata..."
           docker run --rm \
             --entrypoint /bin/sh \
