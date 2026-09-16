@@ -104,6 +104,11 @@ COPY --from=builder /app/opensandbox_server /app/opensandbox_server
 # The Kubernetes example is intentionally not used by the Docker image.
 COPY --from=builder /app/opensandbox_server/examples/example.config.toml /etc/opensandbox/config.toml
 COPY --from=builder /app/opensandbox_server/examples/example.config.zh.toml /etc/opensandbox/config.zh.toml
+
+# Containers must bind the server to all interfaces so the published Docker
+# port is reachable from the host/load balancer. The upstream Docker example
+# intentionally uses 127.0.0.1 for local standalone execution.
+RUN sed -i 's/^host = "127\.0\.0\.1"$/host = "0.0.0.0"/' /etc/opensandbox/config.toml     && grep -E '^(host|port) = ' /etc/opensandbox/config.toml
 COPY --from=builder /app/opensandbox_server/examples/example.batchsandbox-template.yaml /etc/opensandbox/example.batchsandbox-template.yaml
 COPY --from=builder /app/opensandbox_server/examples/e2e.batchsandbox-template.yaml /etc/opensandbox/e2e.batchsandbox-template.yaml
 
