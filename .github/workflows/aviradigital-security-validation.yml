@@ -1117,6 +1117,110 @@ jobs:
           echo "=============================================="
 
       # --------------------------------------------------
+      - name: Scan Docker image
+        run: |
+          set +e
+
+          mkdir -p docker-image-security
+
+          trivy image \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output trivy-image-raw.json \
+            --exit-code 0 \
+            opensandbox-server:security-validation
+
+          python3 <<'PY'
+          import json
+          from collections import Counter
+
+          with open(
+              "trivy-image-raw.json",
+              "r",
+              encoding="utf-8"
+          ) as f:
+              data = json.load(f)
+
+          findings = []
+
+          for result in data.get("Results", []):
+              target = result.get("Target", "")
+
+              for vuln in result.get(
+                  "Vulnerabilities", []
+              ) or []:
+                  findings.append({
+                      "vulnerability_id": vuln.get(
+                          "VulnerabilityID"
+                      ),
+                      "severity": vuln.get("Severity"),
+                      "package": vuln.get("PkgName"),
+                      "installed_version": vuln.get(
+                          "InstalledVersion"
+                      ),
+                      "fixed_version": vuln.get(
+                          "FixedVersion"
+                      ),
+                      "target": target,
+                      "title": vuln.get("Title")
+                  })
+
+          counts = Counter(
+              finding.get("severity") or "UNKNOWN"
+              for finding in findings
+          )
+          fixable = [f for f in findings if f.get("fixed_version")]
+          no_fix = [f for f in findings if not f.get("fixed_version")]
+
+          report = {
+              "image": "opensandbox-server:security-validation",
+              "summary": {
+                  "total_findings": len(findings),
+                  "critical": counts.get("CRITICAL", 0),
+                  "high": counts.get("HIGH", 0)
+              },
+              "findings": findings
+          }
+
+          with open(
+              "docker-image-security/"
+              "docker-image-security-report.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(report, f, indent=2)
+
+          print("")
+          print("========================================")
+          print("Docker Image Security Summary")
+          print("========================================")
+          print(
+              f"Total HIGH/CRITICAL : "
+              f"{len(findings)}"
+          )
+          print(
+              f"CRITICAL           : "
+              f"{counts.get('CRITICAL', 0)}"
+          )
+          print(
+              f"HIGH               : "
+              f"{counts.get('HIGH', 0)}"
+          )
+
+          for finding in findings:
+              print(
+                  f"- {finding['vulnerability_id']} | "
+                  f"{finding['severity']} | "
+                  f"{finding['package']} | "
+                  f"{finding['installed_version']} -> "
+                  f"{finding['fixed_version'] or 'no fixed version'}"
+              )
+          PY
+
+          rm -f trivy-image-raw.json
+
+      # --------------------------------------------------
       # Classify image vulnerabilities
       #
       # HIGH findings with a known fixed version are actionable.
@@ -1320,110 +1424,6 @@ jobs:
 
       # --------------------------------------------------
       # Scan Docker image
-      # --------------------------------------------------
-      - name: Scan Docker image
-        run: |
-          set +e
-
-          mkdir -p docker-image-security
-
-          trivy image \
-            --scanners vuln \
-            --severity HIGH,CRITICAL \
-            --format json \
-            --output trivy-image-raw.json \
-            --exit-code 0 \
-            opensandbox-server:security-validation
-
-          python3 <<'PY'
-          import json
-          from collections import Counter
-
-          with open(
-              "trivy-image-raw.json",
-              "r",
-              encoding="utf-8"
-          ) as f:
-              data = json.load(f)
-
-          findings = []
-
-          for result in data.get("Results", []):
-              target = result.get("Target", "")
-
-              for vuln in result.get(
-                  "Vulnerabilities", []
-              ) or []:
-                  findings.append({
-                      "vulnerability_id": vuln.get(
-                          "VulnerabilityID"
-                      ),
-                      "severity": vuln.get("Severity"),
-                      "package": vuln.get("PkgName"),
-                      "installed_version": vuln.get(
-                          "InstalledVersion"
-                      ),
-                      "fixed_version": vuln.get(
-                          "FixedVersion"
-                      ),
-                      "target": target,
-                      "title": vuln.get("Title")
-                  })
-
-          counts = Counter(
-              finding.get("severity") or "UNKNOWN"
-              for finding in findings
-          )
-          fixable = [f for f in findings if f.get("fixed_version")]
-          no_fix = [f for f in findings if not f.get("fixed_version")]
-
-          report = {
-              "image": "opensandbox-server:security-validation",
-              "summary": {
-                  "total_findings": len(findings),
-                  "critical": counts.get("CRITICAL", 0),
-                  "high": counts.get("HIGH", 0)
-              },
-              "findings": findings
-          }
-
-          with open(
-              "docker-image-security/"
-              "docker-image-security-report.json",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              json.dump(report, f, indent=2)
-
-          print("")
-          print("========================================")
-          print("Docker Image Security Summary")
-          print("========================================")
-          print(
-              f"Total HIGH/CRITICAL : "
-              f"{len(findings)}"
-          )
-          print(
-              f"CRITICAL           : "
-              f"{counts.get('CRITICAL', 0)}"
-          )
-          print(
-              f"HIGH               : "
-              f"{counts.get('HIGH', 0)}"
-          )
-
-          for finding in findings:
-              print(
-                  f"- {finding['vulnerability_id']} | "
-                  f"{finding['severity']} | "
-                  f"{finding['package']} | "
-                  f"{finding['installed_version']} -> "
-                  f"{finding['fixed_version'] or 'no fixed version'}"
-              )
-          PY
-
-          rm -f trivy-image-raw.json
-
       # --------------------------------------------------
       # Upload Docker image security report
       # --------------------------------------------------
