@@ -1117,209 +1117,146 @@ jobs:
           echo "=============================================="
 
       # --------------------------------------------------
-      - name: Scan Docker image
+      - name: Scan, classify and gate Docker image
         run: |
-          set +e
+          set -e
 
-          mkdir -p docker-image-security
+          IMAGE="opensandbox-server:security-validation"
+          WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
+          REPORT_DIR="$WORKSPACE/docker-image-security"
+          RAW_REPORT="$REPORT_DIR/trivy-image-raw.json"
+          REPORT="$REPORT_DIR/docker-image-security-report.json"
+          CLASSIFICATION="$REPORT_DIR/vulnerability-classification.json"
+
+          mkdir -p "$REPORT_DIR"
+
+          echo "========================================"
+          echo "Docker Image Vulnerability Scan"
+          echo "========================================"
+          echo "Workspace : $WORKSPACE"
+          echo "Image     : $IMAGE"
+          echo "Report dir: $REPORT_DIR"
+          echo ""
 
           trivy image \
             --scanners vuln \
             --severity HIGH,CRITICAL \
             --format json \
-            --output trivy-image-raw.json \
+            --output "$RAW_REPORT" \
             --exit-code 0 \
-            opensandbox-server:security-validation
+            "$IMAGE"
 
-          python3 <<'PY'
-          import json
-          from collections import Counter
+          echo ""
+          echo "Trivy scan completed."
+          echo "Checking raw Trivy report..."
 
-          with open(
-              "trivy-image-raw.json",
-              "r",
-              encoding="utf-8"
-          ) as f:
-              data = json.load(f)
-
-          findings = []
-
-          for result in data.get("Results", []):
-              target = result.get("Target", "")
-
-              for vuln in result.get(
-                  "Vulnerabilities", []
-              ) or []:
-                  findings.append({
-                      "vulnerability_id": vuln.get(
-                          "VulnerabilityID"
-                      ),
-                      "severity": vuln.get("Severity"),
-                      "package": vuln.get("PkgName"),
-                      "installed_version": vuln.get(
-                          "InstalledVersion"
-                      ),
-                      "fixed_version": vuln.get(
-                          "FixedVersion"
-                      ),
-                      "target": target,
-                      "title": vuln.get("Title")
-                  })
-
-          counts = Counter(
-              finding.get("severity") or "UNKNOWN"
-              for finding in findings
-          )
-          fixable = [f for f in findings if f.get("fixed_version")]
-          no_fix = [f for f in findings if not f.get("fixed_version")]
-
-          report = {
-              "image": "opensandbox-server:security-validation",
-              "summary": {
-                  "total_findings": len(findings),
-                  "critical": counts.get("CRITICAL", 0),
-                  "high": counts.get("HIGH", 0)
-              },
-              "findings": findings
-          }
-
-          with open(
-              "docker-image-security/"
-              "docker-image-security-report.json",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              json.dump(report, f, indent=2)
-
-          print("")
-          print("========================================")
-          print("Docker Image Security Summary")
-          print("========================================")
-          print(
-              f"Total HIGH/CRITICAL : "
-              f"{len(findings)}"
-          )
-          print(
-              f"CRITICAL           : "
-              f"{counts.get('CRITICAL', 0)}"
-          )
-          print(
-              f"HIGH               : "
-              f"{counts.get('HIGH', 0)}"
-          )
-
-          for finding in findings:
-              print(
-                  f"- {finding['vulnerability_id']} | "
-                  f"{finding['severity']} | "
-                  f"{finding['package']} | "
-                  f"{finding['installed_version']} -> "
-                  f"{finding['fixed_version'] or 'no fixed version'}"
-              )
-          PY
-
-          rm -f trivy-image-raw.json
-
-      # --------------------------------------------------
-      # Classify image vulnerabilities + security gate
-      #
-      # Keep classification and gating in the same step as the
-      # Trivy report generation so there is no cross-step file
-      # dependency.
-      # --------------------------------------------------
-      - name: Classify image vulnerabilities and enforce gate
-        run: |
-          set -e
-
-          REPORT="docker-image-security/docker-image-security-report.json"
-
-          if [ ! -f "$REPORT" ]; then
-            echo "ERROR: Trivy image report was not generated."
-            echo "Expected: $REPORT"
-            echo ""
-            echo "Contents of workspace:"
-            find docker-image-security -maxdepth 2 -type f -print 2>/dev/null || true
+          if [ ! -s "$RAW_REPORT" ]; then
+            echo "ERROR: Trivy did not create a non-empty report."
+            echo "Expected: $RAW_REPORT"
             exit 1
           fi
 
           python3 <<'PY'
           import json
           import sys
+          from collections import Counter
+          from pathlib import Path
 
-          report_file = "docker-image-security/docker-image-security-report.json"
+          raw_report = Path(
+              __import__("os").environ["GITHUB_WORKSPACE"]
+          ) / "docker-image-security" / "trivy-image-raw.json"
 
-          with open(report_file, "r", encoding="utf-8") as f:
-              report = json.load(f)
+          report_file = raw_report.parent / "docker-image-security-report.json"
+          classification_file = raw_report.parent / "vulnerability-classification.json"
 
-          findings = report.get("findings", [])
+          with raw_report.open("r", encoding="utf-8") as f:
+              data = json.load(f)
 
-          critical = []
-          actionable = []
-          no_fix = []
+          findings = []
 
-          for finding in findings:
-              severity = (finding.get("severity") or "").upper()
-              fixed = finding.get("fixed_version")
+          for result in data.get("Results", []) or []:
+              target = result.get("Target", "")
 
-              if severity == "CRITICAL":
-                  critical.append(finding)
+              for vuln in result.get("Vulnerabilities", []) or []:
+                  findings.append({
+                      "vulnerability_id": vuln.get("VulnerabilityID"),
+                      "severity": vuln.get("Severity"),
+                      "package": vuln.get("PkgName"),
+                      "installed_version": vuln.get("InstalledVersion"),
+                      "fixed_version": vuln.get("FixedVersion"),
+                      "target": target,
+                      "title": vuln.get("Title"),
+                  })
 
-              if fixed:
-                  actionable.append(finding)
-              else:
-                  no_fix.append(finding)
+          counts = Counter(
+              (item.get("severity") or "UNKNOWN").upper()
+              for item in findings
+          )
+
+          report = {
+              "image": "opensandbox-server:security-validation",
+              "summary": {
+                  "total_findings": len(findings),
+                  "critical": counts.get("CRITICAL", 0),
+                  "high": counts.get("HIGH", 0),
+              },
+              "findings": findings,
+          }
+
+          report_file.write_text(
+              json.dumps(report, indent=2),
+              encoding="utf-8",
+          )
+
+          critical = [
+              item for item in findings
+              if (item.get("severity") or "").upper() == "CRITICAL"
+          ]
+
+          fixed = [
+              item for item in findings
+              if item.get("fixed_version")
+          ]
+
+          no_fix = [
+              item for item in findings
+              if not item.get("fixed_version")
+          ]
 
           classification = {
               "summary": {
                   "total_high_critical": len(findings),
                   "critical": len(critical),
-                  "actionable_with_fixed_version": len(actionable),
+                  "actionable_with_fixed_version": len(fixed),
                   "no_fix_available": len(no_fix),
               },
-              "actionable_findings": actionable,
-              "no_fix_available": no_fix,
               "critical_findings": critical,
+              "actionable_findings": fixed,
+              "no_fix_available": no_fix,
           }
 
-          classification_file = (
-              "docker-image-security/"
-              "vulnerability-classification.json"
+          classification_file.write_text(
+              json.dumps(classification, indent=2),
+              encoding="utf-8",
           )
 
-          with open(
-              classification_file,
-              "w",
-              encoding="utf-8",
-          ) as f:
-              json.dump(classification, f, indent=2)
-
           print("")
           print("========================================")
-          print("Vulnerability Classification")
+          print("Docker Image Security Summary")
           print("========================================")
-          print(f"Total HIGH/CRITICAL      : {len(findings)}")
-          print(f"CRITICAL                 : {len(critical)}")
-          print(f"Known fixed version      : {len(actionable)}")
-          print(f"No fixed version         : {len(no_fix)}")
+          print(f"Total HIGH/CRITICAL : {len(findings)}")
+          print(f"CRITICAL           : {len(critical)}")
+          print(f"Known fixed version: {len(fixed)}")
+          print(f"No fixed version   : {len(no_fix)}")
           print("")
 
-          for item in actionable:
+          for item in findings:
               print(
-                  "ACTIONABLE | "
-                  f"{item.get('vulnerability_id')} | "
+                  f"- {item.get('vulnerability_id')} | "
                   f"{item.get('severity')} | "
                   f"{item.get('package')} | "
                   f"{item.get('installed_version')} -> "
-                  f"{item.get('fixed_version')}"
-              )
-
-          for item in no_fix:
-              print(
-                  "NO_FIX_AVAILABLE | "
-                  f"{item.get('vulnerability_id')} | "
-                  f"{item.get('severity')} | "
-                  f"{item.get('package')} | "
-                  f"{item.get('installed_version')}"
+                  f"{item.get('fixed_version') or 'no fixed version'}"
               )
 
           print("")
@@ -1331,7 +1268,7 @@ jobs:
               print("FAIL: CRITICAL vulnerabilities detected.")
               sys.exit(1)
 
-          if actionable:
+          if fixed:
               print(
                   "FAIL: HIGH/CRITICAL vulnerabilities with a known "
                   "fixed version remain."
@@ -1348,13 +1285,32 @@ jobs:
                   "WARNING: Findings without a fixed version remain "
                   "and require documented security review/acceptance."
               )
+
+          print("")
+          print("Reports created:")
+          print(report_file)
+          print(classification_file)
           PY
 
           echo ""
-          echo "Classification report:"
-          ls -lh "$REPORT" \
-            docker-image-security/vulnerability-classification.json
-          echo ""
+          echo "Verifying generated reports..."
+          test -s "$REPORT"
+          test -s "$CLASSIFICATION"
+          ls -lh "$REPORT" "$CLASSIFICATION"
+
+          # Keep the raw Trivy report as part of the artifact.
+          echo "Raw Trivy report: $RAW_REPORT"
+
+      # --------------------------------------------------
+      # Upload Docker image security reports
+      # --------------------------------------------------
+      - name: Upload Docker image report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-security-report
+          path: docker-image-security/
+          if-no-files-found: warn
 
       # --------------------------------------------------
       # Generate image SBOM
@@ -1401,10 +1357,3 @@ jobs:
       # --------------------------------------------------
       # Upload Docker image security report
       # --------------------------------------------------
-      - name: Upload Docker image report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image-security-report
-          path: docker-image-security/
-          if-no-files-found: warn
