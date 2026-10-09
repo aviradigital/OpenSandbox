@@ -20,9 +20,8 @@
 #   of jaraco.context/wheel are not retained in the final image
 # - Keep the existing application/runtime layout unchanged
 
-ARG PYTHON_BASE=python:3.10-slim@sha256:8c97ebedc32fd60935cdf5992e935753e2a0f98231830028050e1e04bd3c13c2
-
-FROM ${PYTHON_BASE} AS builder
+ARG SETUPTOOLS_SCM_PRETEND_VERSION
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=$SETUPTOOLS_SCM_PRETEND_VERSION
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -52,11 +51,18 @@ COPY pyproject.toml uv.lock ./
 
 RUN uv sync --frozen --no-dev --no-install-project
 
+# Keep build tooling current enough to avoid shipping the vulnerable
+# setuptools-vendored jaraco.context/wheel versions detected by Trivy.
+RUN uv pip install --python /app/.venv/bin/python --upgrade \
+    "setuptools>=82.0.1" \
+    "wheel>=0.46.2" \
+    "jaraco.context>=6.1.0"
+
 COPY opensandbox_server ./opensandbox_server
 
 COPY LICENSE README.md ./
 
-RUN uv pip install --no-deps --editable .
+RUN uv pip install --python /app/.venv/bin/python --no-deps --editable .
 
 # Keep application environment packaging tools current as well.
 RUN uv pip install --python /app/.venv/bin/python --upgrade \
