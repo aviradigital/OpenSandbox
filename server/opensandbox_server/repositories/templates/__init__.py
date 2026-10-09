@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fsb template catalog repositories."""
+"""Fast Sandbox template catalog repositories."""
 
 from opensandbox_server.repositories.templates.factory import (
-    FsbTemplateRepository,
+    FastSandboxTemplateRepository,
     close_fsb_template_repository,
     create_fsb_template_repository,
     get_fsb_template_repository,
 )
 
 __all__ = [
-    "FsbTemplateRepository",
+    "FastSandboxTemplateRepository",
     "close_fsb_template_repository",
     "create_fsb_template_repository",
     "get_fsb_template_repository",

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,7 +36,7 @@ func StartActiveSocketServer(
 }
 
 // StartActiveSocketServerRequestAware passes the request to active-vault
-// handlers. Sidecar handlers inspect conditional snapshot headers; fleet
+// handlers. Sidecar handlers inspect conditional snapshot headers; fast-sandbox
 // handlers additionally dispatch clientIp (source IP -> subject -> snapshot).
 func StartActiveSocketServerRequestAware(
 	activeHandler func(http.ResponseWriter, *http.Request),

@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -129,8 +129,8 @@ class TLSShadowTest(unittest.TestCase):
                 "invalid_snapshot",
             )
 
-    def test_fleet_absence_does_not_claim_passthrough(self):
-        self.system._set_fleet_mode(True)
+    def test_fast_sandbox_absence_does_not_claim_passthrough(self):
+        self.system._set_fast_sandbox_mode(True)
         self.system._observe_tls_shadow(self.flow(), None)
         self.assertEqual(
             self.system.ctx.log.messages[-1],
