@@ -1,7 +1,7 @@
 # pyright: reportAttributeAccessIssue=false
 # protobuf-generated modules expose dynamic attributes.
 
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,12 +33,12 @@ from opensandbox_server.api.schema import (
     SandboxLifecycle,
     Volume,
 )
-from opensandbox_server.services.fsb.create_mapping import (
+from opensandbox_server.services.fast_sandbox.create_mapping import (
     UnsupportedFieldError,
     map_create_request,
 )
-from opensandbox_server.services.fsb.generated import fastpath_pb2 as pb2
-from opensandbox_server.services.fsb.status_mapping import map_reason, map_state
+from opensandbox_server.services.fast_sandbox.generated import fastpath_pb2 as pb2
+from opensandbox_server.services.fast_sandbox.status_mapping import map_reason, map_state
 
 NOW = datetime(2026, 8, 18, 12, 0, 0, tzinfo=timezone.utc)
 EXPECTED_EXPIRY = int(NOW.timestamp()) + 3600
@@ -128,7 +128,6 @@ def test_map_create_request_rejects_renew_extension_until_it_has_a_read_path():
 @pytest.mark.parametrize(
     "field_name,payload",
     [
-        ("snapshotId", {"image": None, "snapshot_id": "snap-1"}),
         ("platform", {"platform": PlatformSpec(os="linux", arch="amd64")}),
         (
             "resourceRequests",

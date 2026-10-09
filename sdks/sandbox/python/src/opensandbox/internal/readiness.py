@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,11 @@ from typing import Any, TypeVar
 
 import httpx
 
-from opensandbox.exceptions import SandboxApiException, SandboxReadyTimeoutException
+from opensandbox.exceptions import (
+    InvalidArgumentException,
+    SandboxApiException,
+    SandboxReadyTimeoutException,
+)
 from opensandbox.transport._deadline_sync import DEADLINE_EXTENSION
 
 T = TypeVar("T")
@@ -51,8 +55,23 @@ def constrain_readiness_request(request: httpx.Request) -> None:
         }
 
 
+def is_readiness_auth_error(error: Exception) -> bool:
+    """Authentication failures cannot recover by polling the same credentials."""
+    return isinstance(error, SandboxApiException) and error.status_code in (401, 403)
+
+
+def validate_polling_interval(interval: timedelta) -> None:
+    # asyncio.sleep() returns immediately for negative delays (hammering the
+    # health endpoint until the deadline) while time.sleep() raises ValueError.
+    if interval < timedelta(0):
+        raise InvalidArgumentException(
+            f"Ready polling interval must not be negative, got: {interval}"
+        )
+
+
 class ReadinessBudget:
     def __init__(self, timeout: timedelta, interval: timedelta) -> None:
+        validate_polling_interval(interval)
         self.timeout = timeout
         self.context: str | None = None
         self.attempts = 0
@@ -98,6 +117,8 @@ class ReadinessBudget:
             if not done:
                 raise self.expired()
             result = task.result()
+            # Late completions after the deadline are deliberately rejected
+            # (pinned by test_connect_endpoint_readiness).
             self.remaining()
             return result
         finally:
@@ -116,7 +137,13 @@ class ReadinessBudget:
                 self.last_error = error
             await asyncio.sleep(min(self.interval, self.remaining()))
 
-    async def health(self, action: Callable[[], Awaitable[bool]], context: str) -> None:
+    async def health(
+        self,
+        action: Callable[[], Awaitable[bool]],
+        context: str,
+        *,
+        auth_fail_fast: bool = True,
+    ) -> None:
         self.context = context
         self.last_error = None
         while True:
@@ -125,9 +152,15 @@ class ReadinessBudget:
                 if await self.run(action):
                     return
                 self.last_error = None
+            except SandboxReadyTimeoutException:
+                # Re-raise as-is so the cause stays the last *real* error.
+                raise
             except Exception as error:
-                self.remaining()
+                if auth_fail_fast and is_readiness_auth_error(error):
+                    raise
+                # Record before the budget check so a raised timeout carries it.
                 self.last_error = error
+                self.remaining()
             await asyncio.sleep(min(self.interval, self.remaining()))
 
     def run_sync(self, action: Callable[[], T]) -> T:
@@ -136,12 +169,18 @@ class ReadinessBudget:
         try:
             result = action()
         except Exception as error:
-            if self.last_error is None:
+            # Record the latest error so a later expired() reports it. The
+            # budget's own timeout (raised by the readiness request hook when
+            # the deadline passes mid-request) is not a real endpoint error:
+            # keep the last real failure so the cause chain stays meaningful.
+            if not isinstance(error, SandboxReadyTimeoutException):
                 self.last_error = error
             self.remaining()
             raise
         finally:
             _sync_budget.reset(token)
+        # Late completions after the deadline are deliberately rejected
+        # (pinned by test_connect_endpoint_readiness).
         self.remaining()
         return result
 
@@ -155,7 +194,13 @@ class ReadinessBudget:
                 self.last_error = error
             time.sleep(min(self.interval, self.remaining()))
 
-    def health_sync(self, action: Callable[[], bool], context: str) -> None:
+    def health_sync(
+        self,
+        action: Callable[[], bool],
+        context: str,
+        *,
+        auth_fail_fast: bool = True,
+    ) -> None:
         self.context = context
         self.last_error = None
         while True:
@@ -164,7 +209,13 @@ class ReadinessBudget:
                 if self.run_sync(action):
                     return
                 self.last_error = None
+            except SandboxReadyTimeoutException:
+                # Re-raise as-is so the cause stays the last *real* error.
+                raise
             except Exception as error:
-                self.remaining()
+                if auth_fail_fast and is_readiness_auth_error(error):
+                    raise
+                # Record before the budget check so a raised timeout carries it.
                 self.last_error = error
+                self.remaining()
             time.sleep(min(self.interval, self.remaining()))

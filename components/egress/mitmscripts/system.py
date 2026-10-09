@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -48,6 +48,8 @@
 #      Pass-through is skipped when ssl_insecure is enabled, keeping the
 #      explicit insecure-MITM escape hatch working for no-SNI clients.
 #      TCP-layer enforcement (deny/allow rules) still applies to these flows.
+#   5. Owns the authenticated revision receiver only when the Go launcher hands
+#      off a complete per-process internal session. The default remains disabled.
 #
 # User-defined addons can be loaded alongside this script via
 # OPENSANDBOX_EGRESS_MITMPROXY_SCRIPT (comma-separated for multiple scripts).
@@ -60,7 +62,7 @@ import os
 import re
 import socket
 from contextlib import suppress
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import quote, quote_plus, unquote
 
 from mitmproxy import ctx, http
@@ -107,6 +109,14 @@ ACTIVE_VAULT_HEADER_RESERVED_NAMES = {
 _ACTIVE_VAULT_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$")
 _ACTIVE_VAULT_HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _PERCENT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
+_REVISION_RUNTIME_ERROR = "credential proxy: invalid revision runtime configuration"
+_REVISION_ENV = {
+    "socket": "OPENSANDBOX_EGRESS_REVISION_IPC_SOCKET",
+    "token": "OPENSANDBOX_EGRESS_REVISION_IPC_TOKEN",
+    "control": "OPENSANDBOX_EGRESS_REVISION_CONTROL_GENERATION",
+    "subject": "OPENSANDBOX_EGRESS_REVISION_SUBJECT_GENERATION",
+    "limit": "OPENSANDBOX_EGRESS_REVISION_MAX_SNAPSHOT_BYTES",
+}
 
 
 class ActiveVault:
@@ -128,34 +138,126 @@ class ActiveVaultLookupError(Exception):
 
 
 _vault_cache: ActiveVault | None = None
+_revision_receiver: Any | None = None
+_revision_server: Any | None = None
 
 # Operator-only diagnostics; no public interception mode is enabled here.
 _tls_shadow_enabled = os.environ.get(
     "OPENSANDBOX_EGRESS_MITMPROXY_SHADOW", ""
 ).strip().lower() in {"1", "true", "on"}
 
-# Fleet profile: one shared mitmdump serving N sandboxes; the active vault is
+# Fast Sandbox profile: one shared mitmdump serving N sandboxes; the active vault is
 # selected by the client's source IP (preserved by the interception DNAT), so
 # the immutable snapshot cache is keyed per client IP. Every flow performs a
 # conditional snapshot-tag check; the full secret-bearing snapshot is transferred
 # only when its opaque tag changes. The sidecar profile keeps one shared cache.
 # The per-IP cache is bounded because spoofed source IPs could otherwise grow
 # it without limit.
-_fleet_mode_enabled = False
+_fast_sandbox_mode_enabled = False
 _vault_cache_by_ip: dict[str, ActiveVault] = {}
 _VAULT_CACHE_MAX_IPS = 4096
 
 
-def _set_fleet_mode(enabled: bool) -> None:
-    global _fleet_mode_enabled
-    _fleet_mode_enabled = enabled
+def _set_fast_sandbox_mode(enabled: bool) -> None:
+    global _fast_sandbox_mode_enabled
+    _fast_sandbox_mode_enabled = enabled
 
 
-def _set_fleet_mode_from_env() -> None:
-    _set_fleet_mode(os.environ.get("OPENSANDBOX_EGRESS_PROFILE", "").strip().lower() == "fleet")
+def _set_fast_sandbox_mode_from_env() -> None:
+    _set_fast_sandbox_mode(
+        os.environ.get("OPENSANDBOX_EGRESS_PROFILE", "").strip().lower() == "fast-sandbox"
+    )
 
 
-_set_fleet_mode_from_env()
+_set_fast_sandbox_mode_from_env()
+
+
+def _fatal_revision_runtime() -> NoReturn:
+    # mitmproxy 11 loads -s scripts in a reload watcher. Generic exceptions are
+    # swallowed and OptionsError only stops that watcher, so SystemExit is the
+    # process-level fence that prevents a listener without the system addon.
+    raise SystemExit(_REVISION_RUNTIME_ERROR) from None
+
+
+def _revision_configuration() -> tuple[str, str, str, str, int] | None:
+    present = {key for key, name in _REVISION_ENV.items() if name in os.environ}
+    if not present:
+        return None
+    if present != set(_REVISION_ENV):
+        _fatal_revision_runtime()
+    values = {key: os.environ[name] for key, name in _REVISION_ENV.items()}
+    limit_text = values["limit"]
+    if (
+        any(not value for value in values.values())
+        or not limit_text.isascii()
+        or not limit_text.isdecimal()
+    ):
+        _fatal_revision_runtime()
+    try:
+        limit = int(limit_text)
+    except ValueError:
+        _fatal_revision_runtime()
+    if limit <= 0 or limit >= 2**63 or str(limit) != limit_text:
+        _fatal_revision_runtime()
+    return (
+        values["socket"],
+        values["token"],
+        values["control"],
+        values["subject"],
+        limit,
+    )
+
+
+def load(_loader: Any) -> None:
+    """Start one admission-disabled joint owner when the launcher enables it."""
+    global _revision_receiver, _revision_server
+    if _revision_receiver is not None or _revision_server is not None:
+        _fatal_revision_runtime()
+    configuration = _revision_configuration()
+    if configuration is None:
+        return
+    socket_path, token, control, subject, limit = configuration
+    receiver = server = None
+    try:
+        from revision_ipc import Server
+        from revision_publication import InstallationReceiver
+
+        receiver = InstallationReceiver(
+            control,
+            subject,
+            max_snapshot_bytes=limit,
+        )
+        server = Server(
+            receiver,
+            socket_path,
+            token,
+            max_snapshot_bytes=limit,
+            request_timeout=1,
+        )
+        server.start()
+    except Exception:  # noqa: BLE001 - configuration may contain credentials
+        if server is not None:
+            with suppress(Exception):
+                server.close()
+        elif receiver is not None:
+            with suppress(Exception):
+                receiver.close()
+        _fatal_revision_runtime()
+    _revision_receiver = receiver
+    _revision_server = server
+
+
+def done() -> None:
+    """Fence the receiver and remove only its owned socket during addon exit."""
+    global _revision_receiver, _revision_server
+    server = _revision_server
+    _revision_receiver = None
+    _revision_server = None
+    if server is not None:
+        try:
+            server.close()
+        except Exception:  # noqa: BLE001 - never expose session-bearing details
+            ctx.log.warn("credential proxy: revision runtime cleanup failed")
 
 
 class UnixSocketHTTPConnection(http_client.HTTPConnection):
@@ -208,7 +310,7 @@ def tls_clienthello(data: ClientHelloData) -> None:
 
 
 def _load_active_vault(client_ip: str | None = None) -> ActiveVault | None:
-    if _fleet_mode_enabled:
+    if _fast_sandbox_mode_enabled:
         return _load_active_vault_for_ip(client_ip)
     return _load_active_vault_shared()
 
@@ -228,7 +330,7 @@ def _load_active_vault_shared() -> ActiveVault | None:
 
 def _load_active_vault_for_ip(client_ip: str | None) -> ActiveVault | None:
     if not client_ip:
-        raise ActiveVaultLookupError("fleet vault lookup requires a client IP")
+        raise ActiveVaultLookupError("fast-sandbox vault lookup requires a client IP")
     if client_ip not in _vault_cache_by_ip and len(_vault_cache_by_ip) >= _VAULT_CACHE_MAX_IPS:
         _vault_cache_by_ip.clear()
     cached = _vault_cache_by_ip.get(client_ip)
@@ -254,7 +356,7 @@ def _fetch_active_vault(
     )
     path = ACTIVE_VAULT_PATH
     if client_ip:
-        # fleet profile: one shared socket, dispatch inside — the handler
+        # fast-sandbox profile: one shared socket, dispatch inside — the handler
         # resolves clientIp -> subject -> that subject's vault snapshot
         path = f"{ACTIVE_VAULT_PATH}?clientIp={quote(client_ip)}"
     connection = UnixSocketHTTPConnection(socket_path, timeout=0.25)
@@ -580,18 +682,20 @@ def _request_path(flow: http.HTTPFlow) -> str:
 _DOT_SEGMENT_RE = re.compile(r"/\.\.(/|$)")
 
 
-def _path_is_ambiguous(raw_path: str, *, allow_single_encoded_slash: bool = False) -> bool:
+def _path_is_ambiguous(raw_path: str, *, allow_encoded_slash: bool = False) -> bool:
     """Return True if the raw request path could decode to a different path
-    than the one used for binding match (dot-segments, encoded separators).
-    Legitimate clients resolve dot segments before sending, so ``..`` on the
-    wire is an attempt to confuse path-based authorization.
+    than the one used for binding match (dot-segments, backslashes, or a
+    percent-decode that never converges). Legitimate clients resolve dot
+    segments before sending, so ``..`` on the wire is an attempt to confuse
+    path-based authorization.
 
-    ``allow_single_encoded_slash`` tolerates a single-layer ``%2f`` (legit
-    for npm scoped package registry paths like ``/@scope%2fname``) on the
-    raw wire path; nested encodings, backslashes and dot-segments are always
-    rejected. The complementary
-    :func:`_path_encoded_slash_changes_binding` check rejects a ``%2f`` that
-    would cross an authorization boundary.
+    ``allow_encoded_slash`` tolerates ``%2f`` at any percent-decoding depth
+    on the client-supplied path (legit for npm scoped package registry paths
+    like ``/@scope%2fname`` and artifact-store coordinate paths like
+    ``pkg%252F1.0``). Whether an encoded slash is safe is decided by the
+    complementary :func:`_path_decoding_changes_binding` check, which rejects
+    a path whose decoding crosses an authorization boundary. Backslashes and
+    dot-segments are always rejected at every decoding depth.
     """
     path = raw_path.split("?", 1)[0]
 
@@ -599,15 +703,15 @@ def _path_is_ambiguous(raw_path: str, *, allow_single_encoded_slash: bool = Fals
     if _DOT_SEGMENT_RE.search(path):
         return True
 
-    # Iteratively decode to catch nested encodings like %252e%252e or %252f.
+    # Iteratively decode to catch nested encodings like %252e%252e. Decoding
+    # only turns ``%xx`` escapes into literal characters, so anything that
+    # appears at an intermediate depth survives to the fixpoint; checking the
+    # fixpoint covers every depth.
     decoded = path
     for _ in range(10):
         lower = decoded.lower()
-        if "%2f" in lower:
-            # Tolerate a single-layer ``%2f`` on the first pass only; a nested
-            # ``%252f`` decodes back to ``%2f`` and still trips this check.
-            if not (allow_single_encoded_slash and decoded is path):
-                return True
+        if not allow_encoded_slash and "%2f" in lower:
+            return True
         if "%5c" in lower:
             return True
         if "\\" in decoded:
@@ -616,33 +720,53 @@ def _path_is_ambiguous(raw_path: str, *, allow_single_encoded_slash: bool = Fals
         if next_decoded == decoded:
             break
         decoded = next_decoded
+    else:
+        # No fixpoint within the iteration bound: absurdly nested escapes on
+        # a client path mean we cannot establish a canonical view; fail closed.
+        return True
     if _DOT_SEGMENT_RE.search(decoded):
         return True
 
     return False
 
 
-def _path_encoded_slash_changes_binding(
+def _path_decoding_changes_binding(
     flow: http.HTTPFlow, vault: ActiveVault
 ) -> bool:
-    """Return True if decoding ``%2f`` in the raw path would change which
-    credential binding matches (i.e. the encoded slash crosses an
-    authorization boundary). Legit uses like npm scoped packages decode to a
-    path matching the same binding, so they pass; crafted paths like
-    ``/api/v8/projects/123%2f..%2f456/variables`` are rejected before
-    credential injection.
+    """Return True if percent-decoding the raw path to any depth would change
+    which credential binding matches (i.e. decoding crosses an authorization
+    boundary).
+
+    This is the credential-injection invariant: the binding selected on the
+    raw wire path must be identical for every decode depth, so the injection
+    decision does not depend on how many times any downstream processor
+    decodes the path. Legit encoded uses — npm scoped package registry paths
+    like ``/@scope%2fname`` or artifact-store coordinate paths like
+    ``pkg%252F1.0`` — decode to a path matching the same binding, so they
+    pass; crafted paths like ``/api/v8/projects/123%2f..%2f456/variables``
+    are rejected before credential injection.
     """
     raw_path = _request_path(flow)
-    if "%2f" not in raw_path.lower():
+
+    # Collect every intermediate view from the raw path down to the decode
+    # fixpoint, so the invariant holds no matter how many times an encoded
+    # slash is nested (%2f, %252f, %25252f, ...).
+    views = [raw_path]
+    decoded = raw_path
+    for _ in range(10):
+        next_decoded = unquote(decoded)
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+        views.append(decoded)
+
+    if len(views) == 1:
         return False
 
-    decoded_path = unquote(raw_path)
-    if decoded_path == raw_path:
-        return False
-
-    # If the decoded form contains dot-segments, treat it as ambiguous.
-    if _DOT_SEGMENT_RE.search(decoded_path):
-        return True
+    # If any decoded form contains dot-segments, treat it as ambiguous.
+    for view in views[1:]:
+        if _DOT_SEGMENT_RE.search(view):
+            return True
 
     scheme = (flow.request.scheme or "").lower()
     host = _request_host(flow)
@@ -676,7 +800,8 @@ def _path_encoded_slash_changes_binding(
                 matched.add(idx)
         return matched
 
-    return _matches_with_path(raw_path) != _matches_with_path(decoded_path)
+    raw_matches = _matches_with_path(raw_path)
+    return any(_matches_with_path(view) != raw_matches for view in views[1:])
 
 
 def _host_matches(host: str, pattern: str) -> tuple[bool, int]:
@@ -1020,8 +1145,8 @@ def _observe_tls_shadow(
         outcome = project(
             sni, None if vault is None else vault.bindings, lookup_failed=lookup_failed
         )
-        if _fleet_mode_enabled and vault is None and not lookup_failed:
-            # Fleet 404 also means unknown source identity, not just no vault.
+        if _fast_sandbox_mode_enabled and vault is None and not lookup_failed:
+            # Fast Sandbox 404 also means unknown source identity, not just no vault.
             outcome = "unknown_subject_or_vault"
         # Fixed vocabulary only: no hostname, revision, subject, path, or secret.
         ctx.log.warn("credential proxy: tls-shadow " + outcome)
@@ -1060,12 +1185,12 @@ def requestheaders(flow: http.HTTPFlow) -> None:
         return
 
     # Reject ambiguous paths only for requests that would receive credentials:
-    # dot-segments or encoded separators could redirect credentials to a scope
-    # the canonical path does not match. A single-layer ``%2f`` is tolerated
-    # here (npm scoped packages send ``/@scope%2fname``); the next check rejects
-    # it if it crosses a binding boundary.
+    # dot-segments or backslashes could redirect credentials to a scope the
+    # canonical path does not match. Encoded slashes (``%2f`` at any decoding
+    # depth) are tolerated here; the next check rejects them when decoding
+    # would cross a binding boundary.
     raw_path = flow.request.path or "/"
-    if _path_is_ambiguous(raw_path, allow_single_encoded_slash=True):
+    if _path_is_ambiguous(raw_path, allow_encoded_slash=True):
         _reject_request(flow, b"request path contains ambiguous segments\n")
         ctx.log.warn(
             "credential proxy: rejected request with ambiguous path: "
@@ -1073,13 +1198,13 @@ def requestheaders(flow: http.HTTPFlow) -> None:
         )
         return
 
-    # Reject a ``%2f`` only when decoding it changes the binding match, so
-    # ``/@scope%2fname`` stays working while crafted paths like
-    # ``/api/v8/projects/123%2f..%2f456/...`` are stopped.
-    if _path_encoded_slash_changes_binding(flow, vault):
+    # Encoded separators are safe only when every percent-decoding depth of
+    # the path matches the same credential binding, so the injection decision
+    # is independent of how any downstream processor decodes the path.
+    if _path_decoding_changes_binding(flow, vault):
         _reject_request(flow, b"request path contains ambiguous segments\n")
         ctx.log.warn(
-            "credential proxy: rejected request whose encoded slash crosses "
+            "credential proxy: rejected request whose percent-decoding crosses "
             "the credential binding boundary: "
             f"{flow.request.method} {_request_host(flow)}{_request_path(flow)}"
         )
